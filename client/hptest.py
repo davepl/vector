@@ -486,6 +486,7 @@ def print_help() -> None:
         "\nKeys:\n"
         "  0-9  send test pattern\n"
         "  n    next pattern\n"
+        "  a    toggle animation\n"
         "  ?    help\n"
         "  (other keys are passed through to the ESP32)"
     )
@@ -528,8 +529,9 @@ def run_ui(port: str, hz: int) -> None:
     commit_loop(ser, hz)
     print_status(f"Sent test {current} ({len(words)} words), loop={hz} Hz")
 
-    # Disable client-side animation so the ESP32 loop stays stable.
-    frame_interval = None
+    # Animation: 30 FPS when enabled, press 'a' to toggle.
+    anim_fps = 30
+    frame_interval = None  # Start with animation disabled
     next_frame = time.time()
 
     if not sys.stdin.isatty():
@@ -596,6 +598,15 @@ def run_ui(port: str, hz: int) -> None:
                 print_status(
                     f"Sent test {current} ({len(words)} words), loop={hz} Hz"
                 )
+                continue
+            if ch in "aA":
+                if frame_interval is None:
+                    frame_interval = 1.0 / anim_fps
+                    next_frame = time.time()
+                    print_status(f"Animation ON ({anim_fps} FPS)")
+                else:
+                    frame_interval = None
+                    print_status("Animation OFF")
                 continue
 
             # Pass-through to ESP32 (for +++ and console commands).

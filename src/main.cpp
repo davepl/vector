@@ -223,12 +223,21 @@ static bool playbackActiveOnce()
         g_totalVectorsDrawn.fetch_add(vecPerFrame, std::memory_order_relaxed);
     }
 
+    // Reset intensity to max before drawing stats overlay
+    g_hp.SendWord(0x63FFu);  // Intensity max (param 000, value 0x3FF)
+    g_hp.SendWord(0x6FFFu);  // Extra bits set (safety for undocumented behavior)
+    g_hp.SendWord(0x67FFu);  // Focus max (param 001)
+    g_hp.SendWord(0x7000u);  // Writing rate slow (solid lines)
+
+    g_hp.SendWord(g_hp.MakeXWord(0, false));
+    g_hp.SendWord(g_hp.MakeYWord(0, false));
+
     // Always draw stats overlay at top of screen
     char statsLine[64];
-    snprintf(statsLine, sizeof(statsLine), "FPS:%lu.%lu Vec/s:%lu Tot:%llu",
+    snprintf(statsLine, sizeof(statsLine), "FPS:%lu.%lu Vec/f:%lu Tot:%llu",
              (unsigned long)(fps_x10 / 10u),
              (unsigned long)(fps_x10 % 10u),
-             (unsigned long)((vecPerFrame * fps_x10) / 10u),
+             (unsigned long)vecPerFrame,
              (unsigned long long)(totalVec + vecPerFrame));
     g_hp.DrawTextAtSized(20, 1950, statsLine, 1, 0);
 
@@ -331,7 +340,6 @@ public:
             payload_.clear();
             if (payloadNeeded_ > kMaxPayloadBytes)
             {
-                Serial.printf("REJECT: too large cmd=0x%02X len=%u\n", cmd_, (unsigned)lenWords_);
                 g_stats.parse_resyncs.fetch_add(1, std::memory_order_relaxed);
                 Reset();
                 break;
@@ -426,8 +434,6 @@ private:
             const uint16_t computed = crc16_ccitt(crcBuf.data(), crcBuf.size());
             if (computed != received)
             {
-                Serial.printf("CRC FAIL: cmd=0x%02X len=%u rx=0x%04X calc=0x%04X\n",
-                    cmd_, (unsigned)lenWords_, received, computed);
                 g_stats.packets_bad_crc.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
@@ -441,23 +447,16 @@ private:
         switch (cmd_)
         {
         case 0x01: // WRITE_WORDS (append)
-            Serial.printf("RX: WRITE %u words\n", (unsigned)lenWords_);
             appendWords(false);
             break;
         case 0x02: // REPLACE_WORDS
-            Serial.printf("RX: REPLACE %u words\n", (unsigned)lenWords_);
             appendWords(true);
             break;
         case 0x03: // CLEAR
-            Serial.println("RX: CLEAR");
             g_loopEnabled.store(false, std::memory_order_relaxed);
             clearBuffers(true, true);
             break;
         case 0x04: // COMMIT_ONCE
-            {
-                std::lock_guard<std::mutex> lock(g_bufMutex);
-                Serial.printf("RX: COMMIT_ONCE staging=%u\n", (unsigned)g_staging.size());
-            }
             g_loopEnabled.store(false, std::memory_order_relaxed);
             swapStagingToActive();
             break;
@@ -468,10 +467,6 @@ private:
             {
                 hz = (uint16_t)((payload_[1] << 8) | payload_[0]);
             }
-            {
-                std::lock_guard<std::mutex> lock(g_bufMutex);
-                Serial.printf("RX: COMMIT_LOOP hz=%u staging=%u\n", hz, (unsigned)g_staging.size());
-            }
             swapStagingToActive();
             g_loopHz.store(hz, std::memory_order_relaxed);
             g_loopEnabled.store(true, std::memory_order_relaxed);
@@ -479,7 +474,6 @@ private:
             break;
         }
         case 0x06: // STOP_LOOP
-            Serial.println("RX: STOP_LOOP");
             g_loopEnabled.store(false, std::memory_order_relaxed);
             break;
         case 0x07:
@@ -489,12 +483,10 @@ private:
             {
                 modeWord = (uint16_t)((payload_[1] << 8) | payload_[0]);
             }
-            Serial.printf("RX: SET_MODE %u\n", modeWord);
             (void)modeWord;
             break;
         }
         default:
-            Serial.printf("RX: UNKNOWN cmd=0x%02X len=%u\n", cmd_, (unsigned)lenWords_);
             break;
         }
 
