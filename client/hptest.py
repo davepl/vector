@@ -209,7 +209,7 @@ def test_4(b: VectorBuilder, t: float) -> None:
         (0, 4), (1, 5), (2, 6), (3, 7),
     ]
 
-    ax, ay, az = 0.6 + t * 0.35, 0.4 + t * 0.25, 0.3 + t * 0.2
+    ax, ay, az = 0.6 + t * 1.0, 0.4 + t * 0.7, 0.3 + t * 0.5
     cax, sax = math.cos(ax), math.sin(ax)
     cay, say = math.cos(ay), math.sin(ay)
     caz, saz = math.cos(az), math.sin(az)
@@ -252,10 +252,10 @@ def test_4(b: VectorBuilder, t: float) -> None:
 def test_5(b: VectorBuilder, t: float) -> None:
     # Ripple/sombrero mesh (static).
     half = 8.0
-    step = 2.0
+    step = 1.25
     tilt = 0.65
     cosx, sinx = math.cos(tilt), math.sin(tilt)
-    scale = 85.0
+    scale = 125.0
 
     def height(x: float, y: float) -> float:
         r = math.hypot(x, y)
@@ -294,23 +294,24 @@ def test_5(b: VectorBuilder, t: float) -> None:
 
 
 def test_0(b: VectorBuilder, t: float) -> None:
-    # Static starfield streaks.
+    # Animated starfield streaks.
     random.seed(1)
     cx = MAXC * 0.5
     cy = MAXC * 0.5
     focal = MAXC * 1.2
     z_near, z_far = 0.2, 2.0
-    count = 200
+    count = 100
     for _ in range(count):
         angle = random.random() * 2 * math.pi
         radius = random.random() * 0.25
         x = math.cos(angle) * radius
         y = math.sin(angle) * radius
-        # Simple animation by advancing z with time.
-        z = z_near + ((random.random() + t * 0.15) % 1.0) * (z_far - z_near)
+        # Animate z with time - stars fly toward viewer (z decreases).
+        base_z = random.random()
+        z = z_near + ((base_z - t * 0.5) % 1.0) * (z_far - z_near)
         px = cx + (x * focal) / z
         py = cy + (y * focal) / z
-        trail = 4 + (1.0 - (z - z_near) / (z_far - z_near)) * 24
+        trail = 1 + (1.0 - (z - z_near) / (z_far - z_near)) * 48
         dx = cx - px
         dy = cy - py
         dist = math.hypot(dx, dy) or 1.0
@@ -524,28 +525,31 @@ def run_ui(port: str, hz: int) -> None:
 
     print_help()
     current = 0
-    words = build_words(current, 0.0)
-    send_words(ser, words)
-    commit_loop(ser, hz)
-    print_status(f"Sent test {current} ({len(words)} words), loop={hz} Hz")
-
-    # Animation: 30 FPS when enabled, press 'a' to toggle.
+    
+    # Animation: 30 FPS, ON by default. Press 'a' to toggle.
     anim_fps = 30
-    frame_interval = None  # Start with animation disabled
+    frame_interval = 1.0 / anim_fps
     next_frame = time.time()
+    animation_on = True
+    
+    # Send first frame immediately
+    words = build_words(current, time.time())
+    send_words(ser, words)
+    commit_loop(ser, 0)  # hz=0 means play as fast as possible (immediate swap)
+    print_status(f"Sent test {current} ({len(words)} words), animation ON")
 
     if not sys.stdin.isatty():
         write_console("stdin is not a TTY; running headless. Use Ctrl+C to exit.")
         try:
             while True:
                 now = time.time()
-                if frame_interval is not None and now >= next_frame and not console_mode.is_set():
-                    t = now
-                    words = build_words(current, t)
+                if animation_on and now >= next_frame and not console_mode.is_set():
+                    anim_t = now
+                    words = build_words(current, anim_t)
                     send_words(ser, words)
-                    commit_once(ser)
-                    if frame_interval > 0:
-                        next_frame = now + frame_interval
+                    commit_loop(ser, 0)  # Atomic swap, keep looping
+                    ser.flush()
+                    next_frame = time.time() + frame_interval
                 time.sleep(0.002)
         finally:
             ser.close()
@@ -558,13 +562,13 @@ def run_ui(port: str, hz: int) -> None:
         while True:
             rlist, _, _ = select.select([sys.stdin], [], [], 0.01)
             now = time.time()
-            if frame_interval is not None and now >= next_frame and not console_mode.is_set():
-                t = now
-                words = build_words(current, t)
+            if animation_on and now >= next_frame and not console_mode.is_set():
+                anim_t = now
+                words = build_words(current, anim_t)
                 send_words(ser, words)
-                commit_once(ser)
-                if frame_interval > 0:
-                    next_frame = now + frame_interval
+                commit_loop(ser, 0)  # Atomic swap, keep looping
+                ser.flush()
+                next_frame = time.time() + frame_interval
             if not rlist:
                 continue
             ch = sys.stdin.read(1)
@@ -581,10 +585,8 @@ def run_ui(port: str, hz: int) -> None:
                     time.sleep(0.1)
                 words = build_words(current, time.time())
                 send_words(ser, words)
-                commit_loop(ser, hz)
-                print_status(
-                    f"Sent test {current} ({len(words)} words), loop={hz} Hz"
-                )
+                commit_loop(ser, 0)
+                print_status(f"Sent test {current} ({len(words)} words)")
                 continue
             if ch in "nN":
                 current = (current + 1) % 10
@@ -594,18 +596,15 @@ def run_ui(port: str, hz: int) -> None:
                     time.sleep(0.1)
                 words = build_words(current, time.time())
                 send_words(ser, words)
-                commit_loop(ser, hz)
-                print_status(
-                    f"Sent test {current} ({len(words)} words), loop={hz} Hz"
-                )
+                commit_loop(ser, 0)
+                print_status(f"Sent test {current} ({len(words)} words)")
                 continue
             if ch in "aA":
-                if frame_interval is None:
-                    frame_interval = 1.0 / anim_fps
+                animation_on = not animation_on
+                if animation_on:
                     next_frame = time.time()
-                    print_status(f"Animation ON ({anim_fps} FPS)")
+                    print_status("Animation ON (adaptive FPS)")
                 else:
-                    frame_interval = None
                     print_status("Animation OFF")
                 continue
 

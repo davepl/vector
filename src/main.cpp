@@ -44,6 +44,7 @@ struct Stats
     std::atomic<uint32_t> playback_timeouts{0};
     std::atomic<uint32_t> words_received{0};
     std::atomic<uint32_t> frames_rendered{0};
+    std::atomic<uint32_t> frames_received{0};  // New frames swapped in
 };
 
 static Stats g_stats;
@@ -214,10 +215,10 @@ static bool playbackActiveOnce()
                 g_loopEnabled.store(false, std::memory_order_relaxed);
                 return false;
             }
-            // vTaskDelay lets IDLE task run to feed watchdog
-            if (++count % 128 == 0)
+            // vTaskDelay lets IDLE task run to feed watchdog every 32 words
+            if (++count % 32 == 0)
             {
-                vTaskDelay(1);
+                //vTaskDelay(1);
             }
         }
         g_totalVectorsDrawn.fetch_add(vecPerFrame, std::memory_order_relaxed);
@@ -233,12 +234,15 @@ static bool playbackActiveOnce()
     g_hp.SendWord(g_hp.MakeYWord(0, false));
 
     // Always draw stats overlay at top of screen
-    char statsLine[64];
-    snprintf(statsLine, sizeof(statsLine), "FPS:%lu.%lu Vec/f:%lu Tot:%llu",
+    const uint32_t framesRx = g_stats.frames_received.load(std::memory_order_relaxed);
+    const uint32_t badCrc = g_stats.packets_bad_crc.load(std::memory_order_relaxed);
+    char statsLine[80];
+    snprintf(statsLine, sizeof(statsLine), "FPS:%lu.%lu Vec:%lu Rx:%lu Err:%lu",
              (unsigned long)(fps_x10 / 10u),
              (unsigned long)(fps_x10 % 10u),
              (unsigned long)vecPerFrame,
-             (unsigned long long)(totalVec + vecPerFrame));
+             (unsigned long)framesRx,
+             (unsigned long)badCrc);
     g_hp.DrawTextAtSized(20, 1950, statsLine, 1, 0);
 
     g_stats.frames_rendered.fetch_add(1, std::memory_order_relaxed);
@@ -257,7 +261,7 @@ static void LoopTask(void *param)
         {
             // Even when not looping, draw stats overlay periodically
             playbackActiveOnce();
-            vTaskDelay(pdMS_TO_TICKS(1));
+            vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
 
@@ -275,6 +279,8 @@ static void LoopTask(void *param)
         }
         g_lastLoopMs.store(now, std::memory_order_relaxed);
         playbackActiveOnce();
+        // Always yield after frame to feed watchdog
+        vTaskDelay(1);
     }
 }
 
@@ -285,6 +291,7 @@ static void swapStagingToActive()
 {
     std::lock_guard<std::mutex> lock(g_bufMutex);
     g_active = std::make_shared<std::vector<uint16_t>>(g_staging);
+    g_stats.frames_received.fetch_add(1, std::memory_order_relaxed);
 }
 
 static void clearBuffers(bool clearActive, bool clearStaging)
@@ -632,23 +639,24 @@ static void SerialTask(void *param)
 
         if (mode == UIMode::Binary)
         {
-            // Read all available bytes without delay to prevent buffer overflow
+            // Read all available bytes as fast as possible
             int avail = Serial.available();
-            while (avail > 0)
+            if (avail > 0)
             {
-                const uint8_t b = (uint8_t)Serial.read();
-                const uint32_t tnow = millis();
-                feedEscapeDetector(b, tnow);
-                g_parser.ProcessByte(b);
-                avail--;
-                
-                // Yield every 256 bytes to let other tasks run
-                static int yieldCount = 0;
-                if (++yieldCount >= 256)
+                int yieldCount = 0;
+                while (avail > 0)
                 {
-                    yieldCount = 0;
-                    taskYIELD();
+                    const uint8_t b = (uint8_t)Serial.read();
+                    const uint32_t tnow = millis();
+                    feedEscapeDetector(b, tnow);
+                    g_parser.ProcessByte(b);
+                    avail--;
                 }
+            }
+            else
+            {
+                // Only delay when no data available
+                vTaskDelay(1);
             }
             if (escapeGuard2Satisfied(now))
             {
@@ -658,12 +666,7 @@ static void SerialTask(void *param)
         else
         {
             pollConsoleInput();
-        }
-
-        // Only delay if no data was available
-        if (Serial.available() == 0)
-        {
-            vTaskDelay(pdMS_TO_TICKS(1));
+            //vTaskDelay(1);
         }
     }
 }
@@ -895,7 +898,7 @@ static void pollConsoleInput()
 void setup()
 {
     // Increase RX buffer to handle large packets at high baud rate
-    Serial.setRxBufferSize(4096);
+    Serial.setRxBufferSize(8192);
     Serial.begin(921600);
     delay(100);
 
@@ -928,17 +931,17 @@ void setup()
         "LoopTask",
         8192,
         nullptr,
-        3,  // Higher priority for smooth rendering
+        2,  // Medium priority for rendering
         &g_loopTask,
         0); // Core 0
 
-    // Start serial task on Core 0
+    // Start serial task on Core 0 - HIGHER priority to prevent buffer overflow
     xTaskCreatePinnedToCore(
         SerialTask,
         "SerialTask",
         8192,
         nullptr,
-        2,  // Medium priority
+        4,  // Higher priority than LoopTask to drain serial buffer
         &g_serialTask,
         0); // Core 0
 
