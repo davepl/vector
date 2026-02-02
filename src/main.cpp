@@ -114,7 +114,7 @@ static void printHelp()
     Serial.println("  v  toggle verbose logging");
     Serial.println("  b  toggle handshake trace (per-word)");
     Serial.println("  x  toggle RX echo");
-    Serial.println("  0..8  select test pattern");
+    Serial.println("  0..9  select test pattern");
     Serial.println("  n  next test pattern");
 }
 
@@ -206,7 +206,7 @@ static void serviceSerialCommands(bool allowDestructive = true)
             const uint8_t next = (uint8_t)((g_testIndex.load(std::memory_order_relaxed) + 1) % 9);
             g_testIndex.store(next, std::memory_order_relaxed);
             Serial.printf("Test pattern = %u\n", (unsigned)next);
-        } else if (c >= '0' && c <= '8') {
+        } else if (c >= '0' && c <= '9') {
             const uint8_t idx = (uint8_t)(c - '0');
             g_testIndex.store(idx, std::memory_order_relaxed);
             Serial.printf("Test pattern = %u\n", (unsigned)idx);
@@ -443,12 +443,9 @@ static inline uint16_t makeTextWord(uint8_t ch, bool setSize, uint8_t size, uint
            (uint16_t)ch;
 }
 
-static void drawTextAt(uint16_t x, uint16_t y, const char *text)
+static void drawTextAtSized(uint16_t x, uint16_t y, const char *text, uint8_t size, uint8_t rot)
 {
     if (!text || !*text) return;
-    // 1X size, 0° rotation
-    const uint8_t size = 0;
-    const uint8_t rot = 0;
     moveTo(x, y);
     bool first = true;
     for (const char *p = text; *p; ++p) {
@@ -456,6 +453,12 @@ static void drawTextAt(uint16_t x, uint16_t y, const char *text)
         sendWord(makeTextWord(ch, first, size, rot));
         first = false;
     }
+}
+
+static void drawTextAt(uint16_t x, uint16_t y, const char *text)
+{
+    // 1X size, 0° rotation
+    drawTextAtSized(x, y, text, 0, 0);
 }
 
 static void updateFpsText()
@@ -503,7 +506,7 @@ static void initHP1345A()
     // Set focus to sharp (try higher value)
     sendWord(0x67FFu);  // Focus param 001, max value
     
-    // Set writing rate - low for solid lines
+    // Set writing rate - slowest (minimum)
     sendWord(0x7000u);
     
     // Move to origin to establish known position
@@ -636,64 +639,135 @@ static void TestCase3()
 
 static void TestCase4()
 {
-    // Circle + crosshairs
+    // Grid of spinning 3D cubes
     const uint16_t maxc = coordMax();
-    const uint16_t cx = maxc / 2;
-    const uint16_t cy = maxc / 2;
-    const uint16_t r = (maxc / 2) - 40;
-    const uint16_t segments = 80;
-    const float twoPi = 6.283185307f;
+    const float cx = (float)maxc * 0.5f;
+    const float cy = (float)maxc * 0.5f;
 
-    const uint16_t x0 = coordFromNorm(1.0f, cx, r);
-    const uint16_t y0 = coordFromNorm(0.0f, cy, r);
-    moveTo(x0, y0);
-    for (uint16_t i = 1; i <= segments; ++i) {
-        const float a = twoPi * ((float)i / (float)segments);
-        const uint16_t x = coordFromNorm(cosf(a), cx, r);
-        const uint16_t y = coordFromNorm(sinf(a), cy, r);
-        lineTo(x, y);
+    const int cols = 4;
+    const int rows = 3;
+    const int cubeCount = cols * rows; // 36 cubes -> 432 edges (vectors)
+
+    const float gridW = (float)maxc * 0.675f;
+    const float gridH = (float)maxc * 0.675f;
+    const float startX = cx - gridW * 0.5f;
+    const float startY = cy - gridH * 0.5f;
+    const float stepX = gridW / (float)(cols - 1);
+    const float stepY = gridH / (float)(rows - 1);
+
+    const float cubeSize = (float)maxc * 0.150f;
+    const float focal = (float)maxc * 1.2f;
+    const float zBase = (float)maxc * 2.4f;
+
+    struct Vec3 { float x; float y; float z; };
+    static const Vec3 verts[8] = {
+        {-1, -1, -1},
+        { 1, -1, -1},
+        { 1,  1, -1},
+        {-1,  1, -1},
+        {-1, -1,  1},
+        { 1, -1,  1},
+        { 1,  1,  1},
+        {-1,  1,  1},
+    };
+    static const uint8_t edges[12][2] = {
+        {0,1},{1,2},{2,3},{3,0},
+        {4,5},{5,6},{6,7},{7,4},
+        {0,4},{1,5},{2,6},{3,7}
+    };
+
+    const float t = (float)millis() * 0.001f;
+    int idx = 0;
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c, ++idx) {
+            const float ox = startX + (float)c * stepX;
+            const float oy = startY + (float)r * stepY;
+
+            const float phase = (float)idx * 0.35f;
+            const float ax = t * 1.8f + phase;
+            const float ay = t * 1.4f + phase * 0.7f;
+            const float az = t * 1.2f + phase * 0.4f;
+
+            const float cx1 = cosf(ax), sx1 = sinf(ax);
+            const float cy1 = cosf(ay), sy1 = sinf(ay);
+            const float cz1 = cosf(az), sz1 = sinf(az);
+
+            Vec3 proj[8];
+            for (int i = 0; i < 8; ++i) {
+                // Scale
+                float x = verts[i].x * cubeSize;
+                float y = verts[i].y * cubeSize;
+                float z = verts[i].z * cubeSize;
+
+                // Rotate X
+                float y1 = y * cx1 - z * sx1;
+                float z1 = y * sx1 + z * cx1;
+                y = y1; z = z1;
+
+                // Rotate Y
+                float x2 = x * cy1 + z * sy1;
+                float z2 = -x * sy1 + z * cy1;
+                x = x2; z = z2;
+
+                // Rotate Z
+                float x3 = x * cz1 - y * sz1;
+                float y3 = x * sz1 + y * cz1;
+                x = x3; y = y3;
+
+                // Perspective project
+                const float zf = zBase + z;
+                const float px = ox + (x * focal) / zf;
+                const float py = oy + (y * focal) / zf;
+                proj[i] = {px, py, zf};
+            }
+
+            for (int e = 0; e < 12; ++e) {
+                const Vec3 &a = proj[edges[e][0]];
+                const Vec3 &b = proj[edges[e][1]];
+                const uint16_t x0 = clampCoord((int32_t)lroundf(a.x));
+                const uint16_t y0 = clampCoord((int32_t)lroundf(a.y));
+                const uint16_t x1 = clampCoord((int32_t)lroundf(b.x));
+                const uint16_t y1 = clampCoord((int32_t)lroundf(b.y));
+                moveTo(x0, y0);
+                lineTo(x1, y1);
+            }
+        }
     }
-
-    moveTo(cx - r, cy);
-    lineTo(cx + r, cy);
-    moveTo(cx, cy - r);
-    lineTo(cx, cy + r);
 }
 
 static void TestCase5()
 {
-    // Ripple surface (static mesh for max speed)
+    // Ripple surface (animated mesh)
     const uint16_t maxc = coordMax();
     const float width = (float)maxc;
     const float height = (float)maxc;
 
-    const int GRID_RADIUS = 24;
+    const int GRID_RADIUS = 8;
     const int GRID_STEP = 2;
-    const float BASE_TILT_X = 0.85993f; // ~55 deg
+    const float BASE_TILT_X = 0.5993f; // ~55 deg
     const float RIPPLE_FREQ = 0.65f;
     const float RIPPLE_SPEED = 4.0f;
     const float RIPPLE_DECAY = 0.015f;
-    const float HEIGHT_SCALE = 20.0f;
+    const float HEIGHT_SCALE = 5.0f;
     const float AMPLITUDE_FALLOFF = 0.06f;
-    const float FOV = 1200.0f;
-    const float VIEWER_DISTANCE = 40.0f;
-
+    const float VIEWER_DISTANCE = 20.0f;
+    const float ORTHO_SCALE =85.0f;
+    
     struct GridPoint { float x; float y; };
     struct ProjPoint { float x; float y; float depth; bool valid; };
     struct Quad { float depth; int i; int j; };
     struct Segment { uint16_t x0; uint16_t y0; uint16_t x1; uint16_t y1; };
     struct WordPair { uint16_t xWord; uint16_t yWord; };
 
-    static bool cached = false;
+    static bool initialized = false;
     static int gridSize = 0;
     static std::vector<GridPoint> grid;
     static std::vector<ProjPoint> proj;
     static std::vector<Quad> quads;
     static std::vector<Segment> segments;
     static std::vector<WordPair> words;
-    static uint32_t cachedVectorCount = 0;
 
-    if (!cached) {
+    if (!initialized) {
         gridSize = (GRID_RADIUS * 2) / GRID_STEP + 1;
         grid.resize(gridSize * gridSize);
         proj.resize(gridSize * gridSize);
@@ -705,215 +779,208 @@ static void TestCase5()
                 grid[idx++] = { (float)xi, (float)yi };
             }
         }
+        initialized = true;
+    }
 
-        const float t = 0.0f;
-        const float cosx = cosf(BASE_TILT_X);
-        const float sinx = sinf(BASE_TILT_X);
-        const float cosz = 1.0f;
-        const float sinz = 0.0f;
+    const float t = (float)millis() * 0.001f;
+    const float cosx = cosf(BASE_TILT_X);
+    const float sinx = sinf(BASE_TILT_X);
+    const float cosz = 1.0f;
+    const float sinz = 0.0f;
 
-        auto rippleHeight = [&](float x, float y) -> float {
-            const float r = sqrtf(x * x + y * y);
-            const float wave = cosf(r * RIPPLE_FREQ - t * RIPPLE_SPEED);
-            const float envelope = expf(-r * RIPPLE_DECAY);
-            const float amplitude = HEIGHT_SCALE / (1.0f + AMPLITUDE_FALLOFF * r);
-            return wave * envelope * amplitude;
-        };
+    auto rippleHeight = [&](float x, float y) -> float {
+        const float r = sqrtf(x * x + y * y);
+        const float wave = cosf(r * RIPPLE_FREQ - t * RIPPLE_SPEED);
+        const float envelope = expf(-r * RIPPLE_DECAY);
+        const float amplitude = HEIGHT_SCALE / (1.0f + AMPLITUDE_FALLOFF * r);
+        return wave * envelope * amplitude;
+    };
 
-        // Project points
-        for (int i = 0; i < gridSize * gridSize; ++i) {
-            const float x = grid[i].x;
-            const float y = grid[i].y;
-            const float z = rippleHeight(x, y);
+    // Project points
+    for (int i = 0; i < gridSize * gridSize; ++i) {
+        const float x = grid[i].x;
+        const float y = grid[i].y;
+        const float z = rippleHeight(x, y);
 
-            const float xSpin = x * cosz - y * sinz;
-            const float ySpin = x * sinz + y * cosz;
-            const float zSpin = z;
+        const float xSpin = x * cosz - y * sinz;
+        const float ySpin = x * sinz + y * cosz;
+        const float zSpin = z;
 
-            const float yTilt = ySpin * cosx - zSpin * sinx;
-            const float zTilt = ySpin * sinx + zSpin * cosx;
-            const float depth = VIEWER_DISTANCE + zTilt;
-            if (depth <= 0.1f) {
-                proj[i] = {0, 0, 0, false};
+        const float yTilt = ySpin * cosx - zSpin * sinx;
+        const float zTilt = ySpin * sinx + zSpin * cosx;
+        const float depth = VIEWER_DISTANCE + zTilt;
+        if (depth <= 0.1f) {
+            proj[i] = {0, 0, 0, false};
+            continue;
+        }
+        const float px = xSpin * ORTHO_SCALE + (width / 2.0f);
+        const float py = -yTilt * ORTHO_SCALE + (height / 2.0f);
+        proj[i] = {px, py, depth, true};
+    }
+
+    // Build quads (painter's order, far to near)
+    quads.clear();
+    for (int i = 0; i < gridSize - 1; ++i) {
+        for (int j = 0; j < gridSize - 1; ++j) {
+            const int idx00 = i * gridSize + j;
+            const int idx10 = (i + 1) * gridSize + j;
+            const int idx11 = (i + 1) * gridSize + (j + 1);
+            const int idx01 = i * gridSize + (j + 1);
+            if (!proj[idx00].valid || !proj[idx10].valid || !proj[idx11].valid || !proj[idx01].valid) {
                 continue;
             }
-            const float factor = FOV / depth;
-            const float px = xSpin * factor + (width / 2.0f);
-            const float py = -yTilt * factor + (height / 2.0f);
-            proj[i] = {px, py, depth, true};
+            const float avgDepth = (proj[idx00].depth + proj[idx10].depth + proj[idx11].depth + proj[idx01].depth) * 0.25f;
+            quads.push_back({avgDepth, i, j});
         }
+    }
+    std::sort(quads.begin(), quads.end(), [](const Quad &a, const Quad &b) { return a.depth > b.depth; });
 
-        // Build quads (painter's order, far to near)
-        quads.clear();
-        for (int i = 0; i < gridSize - 1; ++i) {
-            for (int j = 0; j < gridSize - 1; ++j) {
-                const int idx00 = i * gridSize + j;
-                const int idx10 = (i + 1) * gridSize + j;
-                const int idx11 = (i + 1) * gridSize + (j + 1);
-                const int idx01 = i * gridSize + (j + 1);
-                if (!proj[idx00].valid || !proj[idx10].valid || !proj[idx11].valid || !proj[idx01].valid) {
-                    continue;
-                }
-                const float avgDepth = (proj[idx00].depth + proj[idx10].depth + proj[idx11].depth + proj[idx01].depth) * 0.25f;
-                quads.push_back({avgDepth, i, j});
-            }
-        }
-        std::sort(quads.begin(), quads.end(), [](const Quad &a, const Quad &b) { return a.depth > b.depth; });
+    segments.clear();
+    segments.reserve(quads.size() * 4);
+    for (const Quad &q : quads) {
+        const int i = q.i;
+        const int j = q.j;
+        const ProjPoint &p00 = proj[i * gridSize + j];
+        const ProjPoint &p10 = proj[(i + 1) * gridSize + j];
+        const ProjPoint &p11 = proj[(i + 1) * gridSize + (j + 1)];
+        const ProjPoint &p01 = proj[i * gridSize + (j + 1)];
 
-        segments.clear();
-        segments.reserve(quads.size() * 4);
-        for (const Quad &q : quads) {
-            const int i = q.i;
-            const int j = q.j;
-            const ProjPoint &p00 = proj[i * gridSize + j];
-            const ProjPoint &p10 = proj[(i + 1) * gridSize + j];
-            const ProjPoint &p11 = proj[(i + 1) * gridSize + (j + 1)];
-            const ProjPoint &p01 = proj[i * gridSize + (j + 1)];
+        auto toSeg = [&](const ProjPoint &a, const ProjPoint &b) {
+            const uint16_t x0 = clampCoord((int32_t)lroundf(a.x));
+            const uint16_t y0 = clampCoord((int32_t)lroundf(a.y));
+            const uint16_t x1 = clampCoord((int32_t)lroundf(b.x));
+            const uint16_t y1 = clampCoord((int32_t)lroundf(b.y));
+            segments.push_back({x0, y0, x1, y1});
+        };
 
-            auto toSeg = [&](const ProjPoint &a, const ProjPoint &b) {
-                const uint16_t x0 = clampCoord((int32_t)lroundf(a.x));
-                const uint16_t y0 = clampCoord((int32_t)lroundf(a.y));
-                const uint16_t x1 = clampCoord((int32_t)lroundf(b.x));
-                const uint16_t y1 = clampCoord((int32_t)lroundf(b.y));
-                segments.push_back({x0, y0, x1, y1});
-            };
+        toSeg(p00, p10);
+        toSeg(p10, p11);
+        toSeg(p11, p01);
+        toSeg(p01, p00);
+    }
 
-            toSeg(p00, p10);
-            toSeg(p10, p11);
-            toSeg(p11, p01);
-            toSeg(p01, p00);
-        }
-
-        words.clear();
-        words.reserve(segments.size() * 2);
-        for (const Segment &s : segments) {
-            words.push_back({makeXWord(s.x0, false), makeYWord(s.y0, false)});
-            words.push_back({makeXWord(s.x1, true), makeYWord(s.y1, true)});
-        }
-
-        cachedVectorCount = (uint32_t)segments.size();
-        cached = true;
+    words.clear();
+    words.reserve(segments.size() * 2);
+    for (const Segment &s : segments) {
+        words.push_back({makeXWord(s.x0, false), makeYWord(s.y0, false)});
+        words.push_back({makeXWord(s.x1, true), makeYWord(s.y1, true)});
     }
 
     for (const WordPair &p : words) {
         sendWord(p.xWord);
         sendWord(p.yWord);
     }
-    g_frameVectorCount += cachedVectorCount;
+    g_frameVectorCount += (uint32_t)segments.size();
 }
 
 static void TestCase6()
 {
-    // Minimal axis sanity test: one horizontal line and one vertical line.
+    // 3D starfield (N=200)
+    struct Star {
+        float x;
+        float y;
+        float z;
+    };
+
     const uint16_t maxc = coordMax();
-    const uint16_t cx = maxc / 2;
-    const uint16_t cy = maxc / 2;
-    const uint16_t m = 80;
+    const float cx = (float)maxc * 0.5f;
+    const float cy = (float)maxc * 0.5f;
 
-    // Horizontal line across the middle
-    moveTo(m, cy);
-    lineTo(maxc - m, cy);
+    const int kStarCount = 200;
+    const float fieldRadius = 0.25f;   // wider emission cone
+    const float zNear = 0.1f;
+    const float zFar = 2.0f;
+    const float speed = 1.25f;        // depth units per second (2x faster)
+    const float focal = (float)maxc * 1.4f;
 
-    // Vertical line across the middle
-    moveTo(cx, m);
-    lineTo(cx, maxc - m);
+    static bool initialized = false;
+    static std::vector<Star> stars;
+    static uint32_t lastMs = 0;
+
+    if (!initialized) {
+        stars.resize(kStarCount);
+        for (int i = 0; i < kStarCount; ++i) {
+            stars[i].x = (random(-1000, 1000) / 1000.0f) * fieldRadius;
+            stars[i].y = (random(-1000, 1000) / 1000.0f) * fieldRadius;
+            stars[i].z = zNear + (random(0, 1000) / 1000.0f) * (zFar - zNear);
+        }
+        lastMs = millis();
+        initialized = true;
+    }
+
+    const uint32_t now = millis();
+    const float dt = (lastMs == 0) ? 0.0f : (float)(now - lastMs) / 1000.0f;
+    lastMs = now;
+
+    for (int i = 0; i < kStarCount; ++i) {
+        Star &s = stars[i];
+        s.z -= speed * dt;
+        if (s.z < zNear) {
+            s.z = zFar;
+            s.x = (random(-1000, 1000) / 1000.0f) * fieldRadius;
+            s.y = (random(-1000, 1000) / 1000.0f) * fieldRadius;
+        }
+
+        const float px = cx + (s.x * focal) / s.z;
+        const float py = cy + (s.y * focal) / s.z;
+
+        if (px >= 0.0f && px <= (float)maxc && py >= 0.0f && py <= (float)maxc) {
+            const uint16_t sx = clampCoord((int32_t)lroundf(px));
+            const uint16_t sy = clampCoord((int32_t)lroundf(py));
+            // Draw as a tiny streak to suggest motion
+            moveTo(sx, sy);
+            lineTo(sx, clampCoord((int32_t)(sy + 1)));
+        }
+    }
 }
 
 static void TestCase7()
 {
-    // Sombrero plot: 3D wireframe of sinc(r) = sin(r)/r
-    // Classic "off at an angle" perspective view
+    // Spirograph (hypotrochoid) pattern
     const uint16_t maxc = coordMax();
     const uint16_t cx = maxc / 2;
     const uint16_t cy = maxc / 2;
-    const float baseScale = maxc * 0.28f;    // Narrower overall
-    const float heightScale = maxc * 0.18f;  // Taller peak
-    
-    const int gridSize = 12;        // Points per radial line
-    const int numRadials = 12;      // Number of radial spokes
-    const float maxR = 3.0f * 3.14159f;  // ~3 periods
-    
-    // Viewing angle parameters - classic perspective
-    const float elevAngle = 0.45f;    // ~25 deg elevation (tilt toward viewer)
-    const float rotAngle = 0.6f;      // ~35 deg rotation around Z
-    const float cosElev = cosf(elevAngle);
-    const float sinElev = sinf(elevAngle);
-    const float cosRot = cosf(rotAngle);
-    const float sinRot = sinf(rotAngle);
-    
-    // Draw radial lines (spokes)
-    for (int spoke = 0; spoke < numRadials; ++spoke) {
-        const float angle = (2.0f * 3.14159f * spoke) / numRadials;
-        const float cosA = cosf(angle);
-        const float sinA = sinf(angle);
-        
-        bool first = true;
-        for (int i = 0; i <= gridSize; ++i) {
-            const float r = (maxR * i) / gridSize;
-            
-            // sinc(r) = sin(r)/r, with sinc(0) = 1
-            float z;
-            if (r < 0.001f) {
-                z = 1.0f;
-            } else {
-                z = sinf(r) / r;
-            }
-            
-            // 3D coordinates
-            const float x3d = r * cosA;
-            const float y3d = r * sinA;
-            const float z3d = z;
-            
-            // Rotate around Z axis, then tilt (elevation)
-            const float xRot = x3d * cosRot - y3d * sinRot;
-            const float yRot = x3d * sinRot + y3d * cosRot;
-            const float xProj = xRot;
-            const float yProj = yRot * cosElev + z3d * sinElev;
-            
-            // Map to screen coordinates (x→horizontal, y→vertical)
-            const uint16_t sx = clampCoord((int32_t)(cx + xProj * baseScale / maxR));
-            const uint16_t sy = clampCoord((int32_t)(cy - yProj * heightScale));
-            
-            if (first) {
-                moveTo(sx, sy);
-                first = false;
-            } else {
-                lineTo(sx, sy);
-            }
-        }
-    }
-    
-    // Draw concentric circles at various radii
-    const int numCircles = 5;
-    const int circlePoints = 24;
-    for (int c = 1; c <= numCircles; ++c) {
-        const float r = (maxR * c) / numCircles;
-        
-        // sinc(r) for this radius
-        float z = sinf(r) / r;
-        
-        bool first = true;
-        for (int i = 0; i <= circlePoints; ++i) {
-            const float angle = (2.0f * 3.14159f * i) / circlePoints;
-            const float x3d = r * cosf(angle);
-            const float y3d = r * sinf(angle);
-            const float z3d = z;
-            
-            // Same projection as spokes
-            const float xRot = x3d * cosRot - y3d * sinRot;
-            const float yRot = x3d * sinRot + y3d * cosRot;
-            const float xProj = xRot;
-            const float yProj = yRot * cosElev + z3d * sinElev;
-            
-            const uint16_t sx = clampCoord((int32_t)(cx + xProj * baseScale / maxR));
-            const uint16_t sy = clampCoord((int32_t)(cy - yProj * heightScale));
-            
-            if (first) {
-                moveTo(sx, sy);
-                first = false;
-            } else {
-                lineTo(sx, sy);
-            }
+
+    // Spirograph parameters (in arbitrary units)
+    const float R = 150.0f;
+    const float r = 105.0f;
+    const float d = 75.0f;
+
+    // Limit to ~200 vectors to keep framerate
+    const int segments = 200;
+
+    // Determine a reasonable closure period
+    const float gcd = 15.0f; // gcd(R, r)
+    const float turns = r / gcd;
+    const float tMax = 2.0f * 3.14159f * turns;
+
+    // Scale to screen
+    const float span = (R - r) + d;
+    const float scale = (maxc * 0.42f) / span;
+
+    // Spin over time
+    const float spinSpeed = 1.0f; // radians/sec
+    const float angle = (float)millis() * 0.001f * spinSpeed;
+    const float cosA = cosf(angle);
+    const float sinA = sinf(angle);
+
+    bool first = true;
+    for (int i = 0; i <= segments; ++i) {
+        const float t = (tMax * i) / segments;
+        const float k = (R - r) / r;
+        const float x = (R - r) * cosf(t) + d * cosf(k * t);
+        const float y = (R - r) * sinf(t) - d * sinf(k * t);
+        const float xr = x * cosA - y * sinA;
+        const float yr = x * sinA + y * cosA;
+
+        const uint16_t sx = clampCoord((int32_t)lroundf(cx + xr * scale));
+        const uint16_t sy = clampCoord((int32_t)lroundf(cy + yr * scale));
+
+        if (first) {
+            moveTo(sx, sy);
+            first = false;
+        } else {
+            lineTo(sx, sy);
         }
     }
 }
@@ -945,6 +1012,80 @@ static void TestCase8()
     }
 }
 
+static void TestCase9()
+{
+    // Matrix-style falling characters (smooth drift)
+    struct MatrixDrop {
+        float x;
+        float y;
+        float speed;
+        char ch;
+        uint32_t nextChangeMs;
+    };
+
+    static std::vector<MatrixDrop> drops;
+    static bool initialized = false;
+    static uint32_t lastMs = 0;
+
+    const uint16_t maxc = coordMax();
+    const float bottomY = -40.0f;
+    const float charHeight = 144.0f;  // 2X size
+    const float marginX = 60.0f;
+    const float topY = (float)maxc - charHeight - 1;
+
+
+    const char *kChars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ#$%&@*+-";
+    const int kCharCount = 10 + 26 + 8;
+
+    const int columnCount = 20;
+    const float colSpacing = (float)(maxc - (uint16_t)(marginX * 2.0f)) / (float)(columnCount - 1);
+
+    if (!initialized) {
+        drops.clear();
+        drops.reserve(columnCount);
+        for (int i = 0; i < columnCount; ++i) {
+            MatrixDrop d;
+            d.x = marginX + (float)i * colSpacing;
+            d.y = topY;
+            d.speed = 240.0f + (float)random(0, 480);  // 4X faster
+            d.ch = kChars[random(0, kCharCount)];
+            d.nextChangeMs = millis() + (uint32_t)random(80, 260);
+            drops.push_back(d);
+        }
+        lastMs = millis();
+        initialized = true;
+    }
+
+    const uint32_t now = millis();
+    const float dt = (lastMs == 0) ? 0.0f : (float)(now - lastMs) / 1000.0f;
+    lastMs = now;
+
+    char buf[2] = {'?', '\0'};
+    for (MatrixDrop &d : drops) {
+        d.y -= d.speed * dt;
+        if (d.y < bottomY) {
+            d.y = topY;
+            d.speed = 500.0f + (float)random(0, 560);
+        }
+
+        if (now >= d.nextChangeMs) {
+            d.ch = kChars[random(0, kCharCount)];
+            d.nextChangeMs = now + (uint32_t)random(80, 260);
+        }
+
+        if (d.y >= 0.0f && d.y <= (float)maxc) {
+            buf[0] = d.ch;
+            drawTextAtSized(
+                clampCoord((int32_t)lroundf(d.x)),
+                clampCoord((int32_t)lroundf(d.y)),
+                buf,
+                2,  // 2X size
+                0
+            );
+        }
+    }
+}
+
 static void RunTestCase(uint8_t idx)
 {
     switch (idx) {
@@ -957,6 +1098,7 @@ static void RunTestCase(uint8_t idx)
         case 6: TestCase6(); break;
         case 7: TestCase7(); break;
         case 8: TestCase8(); break;
+        case 9: TestCase9(); break;
         default: TestCase0(); break;
     }
 }
@@ -1091,7 +1233,7 @@ void loop()
         g_lastVectorCount = g_frameVectorCount;
         updateFpsText();
         // Top-left text: position accounts for 1X character height (~36)
-        const uint16_t x = 12;n
+        const uint16_t x = 12;
         const uint16_t y = coordMax() - 40;
         drawTextAt(x, y, g_statsText);
     } else {
