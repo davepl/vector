@@ -120,7 +120,7 @@ class VectorBuilder:
 # Test patterns 0-9
 # ------------------------------------------------------------
 
-def test_0(b: VectorBuilder, t: float) -> None:
+def test_6(b: VectorBuilder, t: float) -> None:
     m = 80
     minv = m
     maxv = MAXC - m
@@ -293,7 +293,7 @@ def test_5(b: VectorBuilder, t: float) -> None:
                 b.line_to(clamp(px), clamp(py))
 
 
-def test_6(b: VectorBuilder, t: float) -> None:
+def test_0(b: VectorBuilder, t: float) -> None:
     # Static starfield streaks.
     random.seed(1)
     cx = MAXC * 0.5
@@ -475,12 +475,24 @@ def build_words(idx: int, t: float) -> List[int]:
     return b.words
 
 
+def write_console(message: str) -> None:
+    # Normalize all local console output to CRLF for VSCode's serial console.
+    sys.stdout.write(message.replace("\n", "\r\n") + "\r\n")
+    sys.stdout.flush()
+
+
 def print_help() -> None:
-    print("\nKeys:")
-    print("  0-9  send test pattern")
-    print("  n    next pattern")
-    print("  ?    help")
-    print("  (other keys are passed through to the ESP32)")
+    write_console(
+        "\nKeys:\n"
+        "  0-9  send test pattern\n"
+        "  n    next pattern\n"
+        "  ?    help\n"
+        "  (other keys are passed through to the ESP32)"
+    )
+
+
+def print_status(message: str) -> None:
+    write_console(message)
 
 
 def run_ui(port: str, hz: int) -> None:
@@ -513,18 +525,19 @@ def run_ui(port: str, hz: int) -> None:
     current = 0
     words = build_words(current, 0.0)
     send_words(ser, words)
-    commit_once(ser)
-    print(f"Sent test {current} ({len(words)} words)")
+    commit_loop(ser, hz)
+    print_status(f"Sent test {current} ({len(words)} words), loop={hz} Hz")
 
-    frame_interval = 0.0 if hz == 0 else (1.0 / float(hz))
+    # Disable client-side animation so the ESP32 loop stays stable.
+    frame_interval = None
     next_frame = time.time()
 
     if not sys.stdin.isatty():
-        print("stdin is not a TTY; running headless. Use Ctrl+C to exit.")
+        write_console("stdin is not a TTY; running headless. Use Ctrl+C to exit.")
         try:
             while True:
                 now = time.time()
-                if now >= next_frame and not console_mode.is_set():
+                if frame_interval is not None and now >= next_frame and not console_mode.is_set():
                     t = now
                     words = build_words(current, t)
                     send_words(ser, words)
@@ -543,7 +556,7 @@ def run_ui(port: str, hz: int) -> None:
         while True:
             rlist, _, _ = select.select([sys.stdin], [], [], 0.01)
             now = time.time()
-            if now >= next_frame and not console_mode.is_set():
+            if frame_interval is not None and now >= next_frame and not console_mode.is_set():
                 t = now
                 words = build_words(current, t)
                 send_words(ser, words)
@@ -566,8 +579,10 @@ def run_ui(port: str, hz: int) -> None:
                     time.sleep(0.1)
                 words = build_words(current, time.time())
                 send_words(ser, words)
-                commit_once(ser)
-                print(f"Sent test {current} ({len(words)} words)")
+                commit_loop(ser, hz)
+                print_status(
+                    f"Sent test {current} ({len(words)} words), loop={hz} Hz"
+                )
                 continue
             if ch in "nN":
                 current = (current + 1) % 10
@@ -577,8 +592,10 @@ def run_ui(port: str, hz: int) -> None:
                     time.sleep(0.1)
                 words = build_words(current, time.time())
                 send_words(ser, words)
-                commit_once(ser)
-                print(f"Sent test {current} ({len(words)} words)")
+                commit_loop(ser, hz)
+                print_status(
+                    f"Sent test {current} ({len(words)} words), loop={hz} Hz"
+                )
                 continue
 
             # Pass-through to ESP32 (for +++ and console commands).

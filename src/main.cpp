@@ -2,11 +2,14 @@
 #include <Arduino.h>
 #include <atomic>
 #include <cctype>
+#include <cstdarg>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <mutex>
-#include <thread>
 #include <vector>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "screen.h"
 
 // ------------------------------------------------------------
@@ -45,27 +48,38 @@ struct Stats
 
 static Stats g_stats;
 
+// Double-buffered frame data using shared_ptr for atomic swap.
+// Staging buffer accumulates incoming words until commit.
+// Active buffer is what the drawing task renders (atomically swapped).
 static std::vector<uint16_t> g_staging;
-static std::vector<uint16_t> g_active;
+static std::shared_ptr<std::vector<uint16_t>> g_active;
 static std::mutex g_bufMutex;
 
-// OLED refresh thread.
-static std::thread g_screenThread;
+// FreeRTOS task handles
+static TaskHandle_t g_screenTask = nullptr;
+static TaskHandle_t g_loopTask = nullptr;
+static TaskHandle_t g_serialTask = nullptr;
+
+// OLED status data
 static char g_modeLine[32] = "";
 static char g_fpsLine[32] = "";
 static char g_vecLine[32] = "";
 static uint32_t g_screenLastFrames = 0;
 static uint32_t g_screenLastMs = 0;
 
+// Total vectors drawn (for stats overlay)
+static std::atomic<uint64_t> g_totalVectorsDrawn{0};
+
 static size_t activeWordCount()
 {
     std::lock_guard<std::mutex> lock(g_bufMutex);
-    return g_active.size();
+    return g_active ? g_active->size() : 0;
 }
 
 static std::atomic<bool> g_loopEnabled{false};
 static std::atomic<uint16_t> g_loopHz{60};
 static std::atomic<uint32_t> g_lastLoopMs{0};
+static std::atomic<uint32_t> g_lastFrameMs{0};
 static std::atomic<UIMode> g_mode{UIMode::Binary};
 
 // Escape detection (pause +++ pause)
@@ -110,7 +124,6 @@ static void feedEscapeDetector(uint8_t byte, uint32_t nowMs)
 {
     const uint32_t delta = nowMs - g_lastByteMs;
 
-    // If we were waiting for the second guard and a byte arrives early, abort.
     if (g_waitingGuard2)
     {
         g_waitingGuard2 = false;
@@ -168,43 +181,92 @@ static bool escapeGuard2Satisfied(uint32_t nowMs)
 // ------------------------------------------------------------
 static bool playbackActiveOnce()
 {
-    std::vector<uint16_t> local;
+    // Get atomic snapshot of active buffer
+    std::shared_ptr<std::vector<uint16_t>> local;
     {
         std::lock_guard<std::mutex> lock(g_bufMutex);
         local = g_active;
     }
-    if (local.empty())
-        return true;
 
-    for (uint16_t w : local)
+    // Calculate FPS for stats overlay
+    const uint32_t nowMs = millis();
+    const uint32_t lastMs = g_lastFrameMs.exchange(nowMs);
+    uint32_t fps_x10 = 0;
+    if (lastMs > 0 && nowMs > lastMs)
     {
-        if (!g_hp.SendWord(w))
-        {
-            g_stats.playback_timeouts.fetch_add(1, std::memory_order_relaxed);
-            g_loopEnabled.store(false, std::memory_order_relaxed);
-            return false;
-        }
+        fps_x10 = 10000u / (nowMs - lastMs);
     }
+
+    // Calculate vectors per frame and per second
+    const uint32_t wordsPerFrame = local ? (uint32_t)local->size() : 0;
+    const uint32_t vecPerFrame = wordsPerFrame / 4u;
+    const uint64_t totalVec = g_totalVectorsDrawn.load(std::memory_order_relaxed);
+
+    // Draw the frame data if any
+    if (local && !local->empty())
+    {
+        size_t count = 0;
+        for (uint16_t w : *local)
+        {
+            if (!g_hp.SendWord(w))
+            {
+                g_stats.playback_timeouts.fetch_add(1, std::memory_order_relaxed);
+                g_loopEnabled.store(false, std::memory_order_relaxed);
+                return false;
+            }
+            // vTaskDelay lets IDLE task run to feed watchdog
+            if (++count % 128 == 0)
+            {
+                vTaskDelay(1);
+            }
+        }
+        g_totalVectorsDrawn.fetch_add(vecPerFrame, std::memory_order_relaxed);
+    }
+
+    // Always draw stats overlay at top of screen
+    char statsLine[64];
+    snprintf(statsLine, sizeof(statsLine), "FPS:%lu.%lu Vec/s:%lu Tot:%llu",
+             (unsigned long)(fps_x10 / 10u),
+             (unsigned long)(fps_x10 % 10u),
+             (unsigned long)((vecPerFrame * fps_x10) / 10u),
+             (unsigned long long)(totalVec + vecPerFrame));
+    g_hp.DrawTextAtSized(20, 1950, statsLine, 1, 0);
+
     g_stats.frames_rendered.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
-static void serviceLoopPlayback()
+// ------------------------------------------------------------
+// Drawing task - runs on Core 0, continuously renders frames
+// ------------------------------------------------------------
+static void LoopTask(void *param)
 {
-    if (!g_loopEnabled.load(std::memory_order_relaxed))
-        return;
-
-    const uint16_t hz = g_loopHz.load(std::memory_order_relaxed);
-    const uint32_t now = millis();
-    if (hz > 0)
+    (void)param;
+    while (true)
     {
-        const uint32_t interval = (hz == 0) ? 0 : (1000u / hz);
-        const uint32_t last = g_lastLoopMs.load(std::memory_order_relaxed);
-        if (last != 0 && (now - last) < interval)
-            return;
+        if (!g_loopEnabled.load(std::memory_order_relaxed))
+        {
+            // Even when not looping, draw stats overlay periodically
+            playbackActiveOnce();
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
+
+        const uint16_t hz = g_loopHz.load(std::memory_order_relaxed);
+        const uint32_t now = millis();
+        if (hz > 0)
+        {
+            const uint32_t interval = 1000u / hz;
+            const uint32_t last = g_lastLoopMs.load(std::memory_order_relaxed);
+            if (last != 0 && (now - last) < interval)
+            {
+                vTaskDelay(pdMS_TO_TICKS(1));
+                continue;
+            }
+        }
+        g_lastLoopMs.store(now, std::memory_order_relaxed);
+        playbackActiveOnce();
     }
-    g_lastLoopMs.store(now, std::memory_order_relaxed);
-    playbackActiveOnce();
 }
 
 // ------------------------------------------------------------
@@ -213,14 +275,14 @@ static void serviceLoopPlayback()
 static void swapStagingToActive()
 {
     std::lock_guard<std::mutex> lock(g_bufMutex);
-    g_active = g_staging;
+    g_active = std::make_shared<std::vector<uint16_t>>(g_staging);
 }
 
 static void clearBuffers(bool clearActive, bool clearStaging)
 {
     std::lock_guard<std::mutex> lock(g_bufMutex);
     if (clearActive)
-        g_active.clear();
+        g_active.reset();
     if (clearStaging)
         g_staging.clear();
 }
@@ -269,6 +331,7 @@ public:
             payload_.clear();
             if (payloadNeeded_ > kMaxPayloadBytes)
             {
+                Serial.printf("REJECT: too large cmd=0x%02X len=%u\n", cmd_, (unsigned)lenWords_);
                 g_stats.parse_resyncs.fetch_add(1, std::memory_order_relaxed);
                 Reset();
                 break;
@@ -298,7 +361,6 @@ public:
             state_ = State::Dispatch;
             break;
         case State::Dispatch:
-            // Should never get here; handled below.
             Reset();
             break;
         }
@@ -311,8 +373,7 @@ public:
     }
 
 private:
-    static constexpr size_t kMaxPayloadBytes =
-        128 * 1024; // generous cap (64K words)
+    static constexpr size_t kMaxPayloadBytes = 128 * 1024;
     enum class State
     {
         Sync,
@@ -365,6 +426,8 @@ private:
             const uint16_t computed = crc16_ccitt(crcBuf.data(), crcBuf.size());
             if (computed != received)
             {
+                Serial.printf("CRC FAIL: cmd=0x%02X len=%u rx=0x%04X calc=0x%04X\n",
+                    cmd_, (unsigned)lenWords_, received, computed);
                 g_stats.packets_bad_crc.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
@@ -378,19 +441,25 @@ private:
         switch (cmd_)
         {
         case 0x01: // WRITE_WORDS (append)
+            Serial.printf("RX: WRITE %u words\n", (unsigned)lenWords_);
             appendWords(false);
             break;
         case 0x02: // REPLACE_WORDS
+            Serial.printf("RX: REPLACE %u words\n", (unsigned)lenWords_);
             appendWords(true);
             break;
         case 0x03: // CLEAR
+            Serial.println("RX: CLEAR");
             g_loopEnabled.store(false, std::memory_order_relaxed);
             clearBuffers(true, true);
             break;
         case 0x04: // COMMIT_ONCE
+            {
+                std::lock_guard<std::mutex> lock(g_bufMutex);
+                Serial.printf("RX: COMMIT_ONCE staging=%u\n", (unsigned)g_staging.size());
+            }
             g_loopEnabled.store(false, std::memory_order_relaxed);
             swapStagingToActive();
-            playbackActiveOnce();
             break;
         case 0x05:
         { // COMMIT_LOOP
@@ -399,6 +468,10 @@ private:
             {
                 hz = (uint16_t)((payload_[1] << 8) | payload_[0]);
             }
+            {
+                std::lock_guard<std::mutex> lock(g_bufMutex);
+                Serial.printf("RX: COMMIT_LOOP hz=%u staging=%u\n", hz, (unsigned)g_staging.size());
+            }
             swapStagingToActive();
             g_loopHz.store(hz, std::memory_order_relaxed);
             g_loopEnabled.store(true, std::memory_order_relaxed);
@@ -406,6 +479,7 @@ private:
             break;
         }
         case 0x06: // STOP_LOOP
+            Serial.println("RX: STOP_LOOP");
             g_loopEnabled.store(false, std::memory_order_relaxed);
             break;
         case 0x07:
@@ -415,14 +489,12 @@ private:
             {
                 modeWord = (uint16_t)((payload_[1] << 8) | payload_[0]);
             }
-            if (modeWord != 0)
-            {
-                // unsupported; ignore but do not count as error
-            }
+            Serial.printf("RX: SET_MODE %u\n", modeWord);
+            (void)modeWord;
             break;
         }
         default:
-            // Unknown command; ignore to stay in sync.
+            Serial.printf("RX: UNKNOWN cmd=0x%02X len=%u\n", cmd_, (unsigned)lenWords_);
             break;
         }
 
@@ -477,14 +549,29 @@ static BinaryParser g_parser;
 // ------------------------------------------------------------
 // Console mode
 // ------------------------------------------------------------
+static void consolePrintln(const char *msg)
+{
+    Serial.print(msg);
+    Serial.print("\r\n");
+}
+
+static void consolePrintf(const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    Serial.vprintf(fmt, args);
+    va_end(args);
+    Serial.print("\r\n");
+}
+
 static void enterConsoleMode()
 {
     g_mode.store(UIMode::Console, std::memory_order_relaxed);
     g_hp.SetQuiet(false);
-    Serial.println();
-    Serial.println("== HP1345A console ==");
-    Serial.println("Commands: ?,help, stat, clear, once, loop <hz>, stop, arm, "
-                   "disarm, bin, r");
+    consolePrintln("");
+    consolePrintln("== HP1345A console ==");
+    consolePrintln("Commands: ?,help, stat, clear, once, loop <hz>, stop, arm, "
+                   "disarm, bin, r, pentest, bittest <n>, rawpen");
     Serial.print("> ");
 }
 
@@ -497,10 +584,11 @@ static void returnToBinaryMode()
 }
 
 // ------------------------------------------------------------
-// OLED status thread
+// OLED status task - runs on Core 1
 // ------------------------------------------------------------
-static void ScreenThread()
+static void ScreenTask(void *param)
 {
+    (void)param;
     g_screenLastMs = millis();
     while (true)
     {
@@ -521,10 +609,10 @@ static void ScreenThread()
         const uint32_t vecPerSec = (uint32_t)((vecPerFrame * (uint64_t)fps_x10) / 10u);
         snprintf(g_modeLine, sizeof(g_modeLine), "Mode: %s",
                  (mode == UIMode::Binary) ? "Binary" : "Console");
-        snprintf(g_fpsLine, sizeof(g_fpsLine), "FPS/sec: %lu.%lu",
+        snprintf(g_fpsLine, sizeof(g_fpsLine), "FPS: %lu.%lu",
                  (unsigned long)(fps_x10 / 10u),
                  (unsigned long)(fps_x10 % 10u));
-        snprintf(g_vecLine, sizeof(g_vecLine), "VEC/sec: %lu",
+        snprintf(g_vecLine, sizeof(g_vecLine), "Vec/s: %lu",
                  (unsigned long)vecPerSec);
 
         g_screen.Clear();
@@ -532,13 +620,64 @@ static void ScreenThread()
         g_screen.DrawLines(g_modeLine, g_fpsLine, g_vecLine);
         g_screen.Render();
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
+// ------------------------------------------------------------
+// Serial task - runs on Core 0, handles incoming data
+// ------------------------------------------------------------
+static void handleConsoleLine(const char *line);
+static void pollConsoleInput();
+
+static void SerialTask(void *param)
+{
+    (void)param;
+    while (true)
+    {
+        const UIMode mode = g_mode.load(std::memory_order_relaxed);
+        const uint32_t now = millis();
+
+        if (mode == UIMode::Binary)
+        {
+            // Read all available bytes without delay to prevent buffer overflow
+            int avail = Serial.available();
+            while (avail > 0)
+            {
+                const uint8_t b = (uint8_t)Serial.read();
+                const uint32_t tnow = millis();
+                feedEscapeDetector(b, tnow);
+                g_parser.ProcessByte(b);
+                avail--;
+                
+                // Yield every 256 bytes to let other tasks run
+                static int yieldCount = 0;
+                if (++yieldCount >= 256)
+                {
+                    yieldCount = 0;
+                    taskYIELD();
+                }
+            }
+            if (escapeGuard2Satisfied(now))
+            {
+                enterConsoleMode();
+            }
+        }
+        else
+        {
+            pollConsoleInput();
+        }
+
+        // Only delay if no data was available
+        if (Serial.available() == 0)
+        {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
     }
 }
 
 static void handleConsoleLine(const char *line)
 {
-    // Simple whitespace trimming and lowercase.
     char buf[96];
     size_t len = 0;
     for (const char *p = line; *p && len < sizeof(buf) - 1; ++p)
@@ -562,8 +701,8 @@ static void handleConsoleLine(const char *line)
 
     if (buf[0] == '?' || startsWith("help"))
     {
-        Serial.println("Commands: ?,help, stat, clear, once, loop <hz>, stop, arm, "
-                       "disarm, bin, r");
+        consolePrintln("Commands: ?,help, stat, clear, once, loop <hz>, stop, arm, "
+                       "disarm, bin, r, pentest, bittest <n>, rawpen");
     }
     else if (startsWith("stat"))
     {
@@ -574,41 +713,38 @@ static void handleConsoleLine(const char *line)
         {
             std::lock_guard<std::mutex> lock(g_bufMutex);
             stagingSize = g_staging.size();
-            activeSize = g_active.size();
+            activeSize = g_active ? g_active->size() : 0;
         }
-        Serial.printf("mode=%s  loop=%s hz=%u  staging=%u words  active=%u words\n",
+        consolePrintf("mode=%s  loop=%s hz=%u  staging=%u words  active=%u words",
                       (mode == UIMode::Binary) ? "binary" : "console",
                       loop ? "on" : "off", (unsigned)hz, (unsigned)stagingSize,
                       (unsigned)activeSize);
-        Serial.printf(
-            "packets: ok=%lu crc_fail=%lu resync=%lu\n",
+        consolePrintf(
+            "packets: ok=%lu crc_fail=%lu resync=%lu",
             (unsigned long)g_stats.packets_ok.load(std::memory_order_relaxed),
             (unsigned long)g_stats.packets_bad_crc.load(std::memory_order_relaxed),
             (unsigned long)g_stats.parse_resyncs.load(std::memory_order_relaxed));
-        Serial.printf(
-            "playback: frames=%lu timeouts=%lu  words_rx=%lu\n",
+        consolePrintf(
+            "playback: frames=%lu timeouts=%lu  words_rx=%lu",
             (unsigned long)g_stats.frames_rendered.load(std::memory_order_relaxed),
-            (unsigned long)g_stats.playback_timeouts.load(
-                std::memory_order_relaxed),
+            (unsigned long)g_stats.playback_timeouts.load(std::memory_order_relaxed),
             (unsigned long)g_stats.words_received.load(std::memory_order_relaxed));
     }
     else if (startsWith("clear"))
     {
         g_loopEnabled.store(false, std::memory_order_relaxed);
         clearBuffers(true, true);
-        Serial.println("Cleared buffers.");
+        consolePrintln("Cleared buffers.");
     }
     else if (startsWith("once"))
     {
         g_loopEnabled.store(false, std::memory_order_relaxed);
         swapStagingToActive();
-        playbackActiveOnce();
-        Serial.println("Played active buffer once.");
+        consolePrintln("Played active buffer once.");
     }
     else if (startsWith("loop"))
     {
         uint16_t hz = 60;
-        // Parse optional number after space.
         char *endp = nullptr;
         const char *num = strchr(buf, ' ');
         if (num)
@@ -619,32 +755,109 @@ static void handleConsoleLine(const char *line)
         g_loopHz.store(hz, std::memory_order_relaxed);
         g_loopEnabled.store(true, std::memory_order_relaxed);
         g_lastLoopMs.store(0, std::memory_order_relaxed);
-        Serial.printf("Looping active buffer at %u Hz (0=fast).\n", (unsigned)hz);
+        consolePrintf("Looping active buffer at %u Hz (0=fast).", (unsigned)hz);
     }
     else if (startsWith("stop"))
     {
         g_loopEnabled.store(false, std::memory_order_relaxed);
-        Serial.println("Loop stopped.");
+        consolePrintln("Loop stopped.");
     }
     else if (startsWith("arm"))
     {
         g_hp.SetTransfersEnabled(true);
-        Serial.println("Bus armed (transfers enabled).");
+        consolePrintln("Bus armed (transfers enabled).");
     }
     else if (startsWith("disarm"))
     {
         g_hp.SetTransfersEnabled(false);
-        Serial.println("Bus disarmed (transfers paused).");
+        consolePrintln("Bus disarmed (transfers paused).");
     }
     else if (startsWith("bin") || startsWith("r"))
     {
-        Serial.println("Returning to binary mode.");
+        consolePrintln("Returning to binary mode.");
         returnToBinaryMode();
         return;
     }
+    else if (startsWith("pentest"))
+    {
+        // Draw a pattern that alternates pen up/down to test bit 11 (GPIO 37)
+        consolePrintln("Pen test: Drawing 5 separate horizontal lines...");
+        consolePrintln("If wiring is correct, you should see 5 SEPARATE lines.");
+        consolePrintln("If bit 11 is stuck, you'll see one connected zigzag.");
+        
+        g_loopEnabled.store(false, std::memory_order_relaxed);
+        
+        // Clear and draw test pattern directly
+        const uint16_t PEN_UP = 0x0000;   // bit 11 = 0 (move)
+        const uint16_t PEN_DOWN = 0x0800; // bit 11 = 1 (draw)
+        
+        for (int i = 0; i < 5; i++)
+        {
+            uint16_t y = 500 + i * 200;  // Y positions: 500, 700, 900, 1100, 1300
+            
+            // Move to start (pen UP)
+            g_hp.SendWord(200 | PEN_UP);        // X low
+            g_hp.SendWord(y | PEN_UP);          // Y low  
+            
+            // Draw to end (pen DOWN)
+            g_hp.SendWord(1800 | PEN_DOWN);     // X high
+            g_hp.SendWord(y | PEN_DOWN);        // Y high
+        }
+        consolePrintln("Pen test complete.");
+    }
+    else if (startsWith("bittest"))
+    {
+        // Test individual data bits
+        char *endp = nullptr;
+        const char *num = strchr(buf, ' ');
+        if (!num)
+        {
+            consolePrintln("Usage: bittest <bit_number 0-14>");
+            consolePrintln("Bit 11 (GPIO 37) = pen state");
+            Serial.print("> ");
+            return;
+        }
+        int bit = (int)strtol(num + 1, &endp, 10);
+        if (bit < 0 || bit > 14)
+        {
+            consolePrintln("Bit must be 0-14");
+            Serial.print("> ");
+            return;
+        }
+        
+        uint16_t word = (1u << bit);
+        consolePrintf("Sending word 0x%04X (bit %d set)", word, bit);
+        consolePrintf("GPIO for bit %d = pin %d", bit, kHpPins.data[bit]);
+        
+        // Send several times to make it visible on scope
+        for (int i = 0; i < 100; i++)
+        {
+            g_hp.SendWord(word);
+            g_hp.SendWord(0x0000);
+        }
+        consolePrintln("Done - check with scope on that GPIO.");
+    }
+    else if (startsWith("rawpen"))
+    {
+        // Send raw words with explicit pen control for debugging
+        consolePrintln("Sending raw pen test...");
+        consolePrintln("Move to (100,100) pen UP, then draw to (1900,100) pen DOWN");
+        
+        // Pen UP move
+        g_hp.SendWord(100);          // X=100, bit11=0 (pen up)
+        g_hp.SendWord(100);          // Y=100, bit11=0 (pen up)
+        
+        // Pen DOWN draw  
+        g_hp.SendWord(1900 | 0x0800); // X=1900, bit11=1 (pen down)
+        g_hp.SendWord(100 | 0x0800);  // Y=100, bit11=1 (pen down)
+        
+        consolePrintln("If pen works: single horizontal line at Y=100");
+        consolePrintln("If pen stuck DOWN: line from origin to (100,100) to (1900,100)");
+        consolePrintln("If pen stuck UP: nothing visible");
+    }
     else
     {
-        Serial.println("Unknown command. Type 'help' for list.");
+        consolePrintln("Unknown command. Type 'help' for list.");
     }
 
     Serial.print("> ");
@@ -689,59 +902,63 @@ static void pollConsoleInput()
 // ------------------------------------------------------------
 void setup()
 {
+    // Increase RX buffer to handle large packets at high baud rate
+    Serial.setRxBufferSize(4096);
     Serial.begin(921600);
-    delay(50);
+    delay(100);
 
-    g_hp.SetQuiet(true); // suppress prints during binary mode
+    g_hp.SetQuiet(true);
     g_hp.SetServiceCallback(nullptr);
     g_hp.ConfigurePins();
     g_hp.InitializeDisplay();
-    g_hp.SetPenInvert(true);
+    g_hp.SetPenInvert(false);  // HP1345A: bit11=1 means pen DOWN
 
+    // Initialize OLED and start screen task on Core 1
     const bool oledOk = g_screen.Init();
-    if (false && oledOk)
+    if (oledOk)
     {
         g_screen.Clear();
         g_screen.DrawBorder();
         g_screen.Render();
-        g_screenThread = std::thread(ScreenThread);
-        g_screenThread.detach();
+        xTaskCreatePinnedToCore(
+            ScreenTask,
+            "ScreenTask",
+            4096,
+            nullptr,
+            1,  // Low priority
+            &g_screenTask,
+            1); // Core 1
     }
-    else
-    {
-        Serial.println("OLED init failed (check SDA/SCL/addr/Vext).");
-    }
+
+    // Start drawing/loop task on Core 0
+    xTaskCreatePinnedToCore(
+        LoopTask,
+        "LoopTask",
+        8192,
+        nullptr,
+        3,  // Higher priority for smooth rendering
+        &g_loopTask,
+        0); // Core 0
+
+    // Start serial task on Core 0
+    xTaskCreatePinnedToCore(
+        SerialTask,
+        "SerialTask",
+        8192,
+        nullptr,
+        2,  // Medium priority
+        &g_serialTask,
+        0); // Core 0
 
     resetEscapeDetector();
     g_parser.Reset();
 
-    Serial.println(
-        "HP1345A streamer ready (binary). Send pause+++pause to enter console.");
+    Serial.printf("HP1345A streamer ready (binary) - built %s %s\n", __DATE__, __TIME__);
+    Serial.println("Send pause+++pause to enter console.");
 }
 
 void loop()
 {
-    const UIMode mode = g_mode.load(std::memory_order_relaxed);
-    const uint32_t now = millis();
-
-    if (mode == UIMode::Binary)
-    {
-        while (Serial.available() > 0)
-        {
-            const uint8_t b = (uint8_t)Serial.read();
-            const uint32_t tnow = millis();
-            feedEscapeDetector(b, tnow);
-            g_parser.ProcessByte(b);
-        }
-        if (escapeGuard2Satisfied(now))
-        {
-            enterConsoleMode();
-        }
-    }
-    else
-    {
-        pollConsoleInput();
-    }
-
-    serviceLoopPlayback();
+    // All work is handled by FreeRTOS tasks
+    vTaskDelay(pdMS_TO_TICKS(100));
 }
