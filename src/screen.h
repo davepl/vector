@@ -29,6 +29,7 @@ public:
     void Clear();
     void DrawBorder();
     void DrawStatus(bool connected);
+    void DrawLines(const char* line1, const char* line2, const char* line3);
     void Render();
 
 private:
