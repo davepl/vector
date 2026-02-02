@@ -24,6 +24,7 @@ Screen::Screen(uint8_t sda, uint8_t scl, uint8_t addr, int8_t rstPin, int8_t vex
 {
 }
 
+// Power the OLED (Vext) and toggle reset if available.
 void Screen::PowerOn()
 {
     if (m_vextPin >= 0) {
@@ -42,11 +43,13 @@ void Screen::PowerOn()
     }
 }
 
+// Initialize the OLED using the default pins/addr.
 bool Screen::Init()
 {
     return InitWithPins(m_sda, m_scl, m_addr);
 }
 
+// Initialize the OLED using explicit I2C pins and address.
 bool Screen::InitWithPins(uint8_t sda, uint8_t scl, uint8_t addr)
 {
     PowerOn();
@@ -63,6 +66,7 @@ bool Screen::InitWithPins(uint8_t sda, uint8_t scl, uint8_t addr)
     return true;
 }
 
+// Scan the given I2C pins for a responding device.
 uint8_t Screen::Scan(uint8_t sda, uint8_t scl)
 {
     PowerOn();
@@ -82,18 +86,21 @@ uint8_t Screen::Scan(uint8_t sda, uint8_t scl)
     return found;
 }
 
+// Clear the framebuffer.
 void Screen::Clear()
 {
     std::lock_guard<std::mutex> lock(g_displayMutex);
     g_display.clearDisplay();
 }
 
+// Draw a simple border around the OLED.
 void Screen::DrawBorder()
 {
     std::lock_guard<std::mutex> lock(g_displayMutex);
     g_display.drawRect(0, 0, kScreenWidth, kScreenHeight, SSD1306_WHITE);
 }
 
+// Draw the connection status text.
 void Screen::DrawStatus(bool connected)
 {
     const char *text = connected ? "Connected: YES" : "Connected: NO";
@@ -111,6 +118,7 @@ void Screen::DrawStatus(bool connected)
     g_display.print(text);
 }
 
+// Flush the framebuffer to the OLED.
 void Screen::Render()
 {
     std::lock_guard<std::mutex> lock(g_displayMutex);

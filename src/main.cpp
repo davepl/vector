@@ -1,12 +1,12 @@
 #include <Arduino.h>
-#include "driver/gpio.h"
-#include <math.h>
 #include <algorithm>
-#include <stdio.h>
-#include <vector>
-#include <thread>
 #include <atomic>
 #include <chrono>
+#include <math.h>
+#include <stdio.h>
+#include <thread>
+#include <vector>
+#include "hp_vector_device.h"
 #include "screen.h"
 
 // -------------------------
@@ -43,66 +43,34 @@
 // XACK   -> GPIO39 (IN)   (704 mode later)
 // -------------------------
 
-static const int PIN_DAV  = 20;
-static const int PIN_RFD  = 19;
-
-// Present for later, not used in this bring-up:
-static const int PIN_DS   = -1;
-static const int PIN_RD   = -1;
-static const int PIN_XACK = -1;
-
-// D0..D14 bit order: bit0 -> D0 ... bit14 -> D14
-// Avoid strapping pins GPIO0/3/45/46 so ESP32 can be programmed while HP is powered.
-static const int DATA_PINS[15] = {
-    1,  2,  3,  4,  5,  6,
-    7,  39, 40, 41, 42, 37,   // D11: GPIO37 (pen bit)
-    33, 47, 48                 // D12: GPIO33
+static const HPVectorDevice::Pins kHpPins = {
+    20,  // dav
+    19,  // rfd
+    -1,  // ds
+    -1,  // rd
+    -1,  // xack
+    {1, 2, 3, 4, 5, 6, 7, 39, 40, 41, 42, 37, 33, 47, 48}
 };
 
-// HP1345A Word Format (from PHK's reverse-engineering):
-// -------------------------------------------------------
-// Bits 14:13 determine command type:
-//   00 = Plot mode (vectors)
-//   01 = Graph mode
-//   10 = Text mode
-//   11 = Set Condition
-//
-// For Plot mode (bits 14:13 = 00):
-//   Bit 12: 0 = X coordinate (stores value, no action)
-//           1 = Y coordinate (triggers move/draw using stored X and this Y)
-//   Bit 11: 0 = pen up (move), 1 = pen down (draw) — only meaningful on Y word
-//   Bits 10:0 = 11-bit coordinate (0–2047)
-//
-// Drawing rule: Send X word first (stores X), then Y word (executes with pen state).
-// The pen bit on X is ignored; only the pen bit on the Y word matters.
+static HPVectorDevice g_hp(kHpPins);
 
-static inline uint16_t coordMax() { return 2047u; }  // 11-bit coordinates
+// HP1345A word format details live in HPVectorDevice for easier reuse.
 
-// Status counters
-static uint32_t g_okCount = 0;
-static uint32_t g_timeoutCount = 0;
-static uint32_t g_lastTimeoutReportMs = 0;
-static std::atomic<uint32_t> g_lastOkMs{0};
-static std::atomic<bool> g_connected{false};
+// Forward declarations for helpers that wrap the device.
+static void hpMoveTo(uint16_t x, uint16_t y);
+static void hpLineTo(uint16_t x, uint16_t y);
+
 static std::thread g_screenThread;
-static std::atomic<bool> g_runTransfers{true};
-static std::atomic<bool> g_abortWaits{false};
-// RFD polarity: active-low (confirmed working)
-static bool g_rfdActiveLow = true;
-// Pen sense: false = bit11=1 for draw (PHK), true = bit11=0 for draw (inverted)
-static std::atomic<bool> g_penInvert{false};
-static std::atomic<bool> g_verbose{false};
-static std::atomic<bool> g_traceHandshake{false};
 static std::atomic<bool> g_echoRx{false};
 static std::atomic<uint8_t> g_testIndex{0};
 static std::atomic<bool> g_starfieldReset{true};
 static uint32_t g_fpsFrames = 0;
 static uint32_t g_fpsLastMs = 0;
-static char g_fpsText[16] = "FPS:0";
 static uint32_t g_frameVectorCount = 0;
 static uint32_t g_lastVectorCount = 0;
 static char g_statsText[24] = "FPS:0 V:0";
 
+// Print the serial command help menu.
 static void printHelp()
 {
     Serial.println("Commands:");
@@ -119,60 +87,32 @@ static void printHelp()
     Serial.println("  n  next test pattern");
 }
 
-// Forward declarations for text helpers (defined later).
-static void moveTo(uint16_t x, uint16_t y);
 
+// Report the current input pin states.
 static void reportInputs()
 {
-    Serial.printf("inputs: RFD=%d\n", digitalRead(PIN_RFD));
-    if (PIN_XACK >= 0) {
-        Serial.printf("inputs: XACK=%d\n", digitalRead(PIN_XACK));
-    }
+    g_hp.ReportInputs(Serial);
 }
+
+// Print a compact bus status line to Serial.
 static void printBusStatus()
 {
-    Serial.printf("DAV(GPIO%d)=%d  RFD(GPIO%d)=%d  coordMax=%u  test=%u  verbose=%u\n",
-                  PIN_DAV,
-                  digitalRead(PIN_DAV),
-                  PIN_RFD,
-                  digitalRead(PIN_RFD),
-                  (unsigned)coordMax(),
-                  (unsigned)g_testIndex.load(std::memory_order_relaxed),
-                  (unsigned)g_verbose.load(std::memory_order_relaxed));
-
-    Serial.printf("trace: handshake=%u\n", (unsigned)g_traceHandshake.load(std::memory_order_relaxed));
+    g_hp.PrintBusStatus(Serial, g_testIndex.load(std::memory_order_relaxed));
 }
 
+// Pulse DAV low for a wiring check.
 static void pulseDavLowMs(uint32_t holdMs)
 {
-    // Force DAV output low briefly for wiring verification.
-    // Use a DMM/scope on HP connector pin 10: it should drop near 0V during the pulse.
-    digitalWrite(PIN_DAV, HIGH);
-    delay(5);
-    digitalWrite(PIN_DAV, LOW);
-    delay(holdMs);
-    digitalWrite(PIN_DAV, HIGH);
+    g_hp.PulseDavLowMs(holdMs);
 }
 
+// Toggle the D11 data bit to verify wiring.
 static void toggleD11ForWiringCheck()
 {
-    // Toggle D11 (pen bit) slowly so user can probe GPIO26 and HP pin D11
-    // D11 = DATA_PINS[11] = GPIO26
-    const int pin = DATA_PINS[11];
-    Serial.printf("Toggling D11 (pen bit) on GPIO%d - probe this pin and HP D11\n", pin);
-    Serial.println("Press any key to stop...");
-    while (!Serial.available()) {
-        digitalWrite(pin, HIGH);
-        Serial.print("D11=HIGH ");
-        delay(500);
-        digitalWrite(pin, LOW);
-        Serial.print("D11=LOW ");
-        delay(500);
-    }
-    while (Serial.available()) Serial.read(); // flush
-    Serial.println("\nD11 toggle stopped.");
+    g_hp.ToggleD11ForWiringCheck(Serial);
 }
 
+// Handle incoming serial commands; optionally skip destructive actions.
 static void serviceSerialCommands(bool allowDestructive = true)
 {
     // Keep command handling lightweight so we can call it from tight loops.
@@ -192,19 +132,19 @@ static void serviceSerialCommands(bool allowDestructive = true)
         if (c == 's' || c == 'S') {
             printBusStatus();
         } else if (c == 'v' || c == 'V') {
-            const bool nv = !g_verbose.load(std::memory_order_relaxed);
-            g_verbose.store(nv, std::memory_order_relaxed);
+            const bool nv = !g_hp.Verbose();
+            g_hp.SetVerbose(nv);
             Serial.printf("Verbose %s\n", nv ? "ON" : "OFF");
         } else if (c == 'b' || c == 'B') {
-            const bool nv = !g_traceHandshake.load(std::memory_order_relaxed);
-            g_traceHandshake.store(nv, std::memory_order_relaxed);
+            const bool nv = !g_hp.TraceHandshake();
+            g_hp.SetTraceHandshake(nv);
             Serial.printf("Handshake trace %s\n", nv ? "ON" : "OFF");
         } else if (c == 'x' || c == 'X') {
             const bool nv = !g_echoRx.load(std::memory_order_relaxed);
             g_echoRx.store(nv, std::memory_order_relaxed);
             Serial.printf("RX echo %s\n", nv ? "ON" : "OFF");
         } else if (c == 'n' || c == 'N') {
-            const uint8_t next = (uint8_t)((g_testIndex.load(std::memory_order_relaxed) + 1) % 9);
+            const uint8_t next = (uint8_t)((g_testIndex.load(std::memory_order_relaxed) + 1) % 10);
             g_testIndex.store(next, std::memory_order_relaxed);
             Serial.printf("Test pattern = %u\n", (unsigned)next);
         } else if (c >= '0' && c <= '9') {
@@ -212,25 +152,15 @@ static void serviceSerialCommands(bool allowDestructive = true)
             g_testIndex.store(idx, std::memory_order_relaxed);
             Serial.printf("Test pattern = %u\n", (unsigned)idx);
         } else if (c == 'p' || c == 'P') {
-            // Toggle pen sense at runtime.
-            const bool nv = !g_penInvert.load(std::memory_order_relaxed);
-            g_penInvert.store(nv, std::memory_order_relaxed);
+            const bool nv = !g_hp.PenInvert();
+            g_hp.SetPenInvert(nv);
             Serial.printf("Pen sense: %s (bit11=1 means %s)\n",
                           nv ? "INVERTED" : "NORMAL",
                           nv ? "pen UP" : "pen DOWN");
         } else if (c == 't' || c == 'T') {
-            const bool newVal = !g_runTransfers.load(std::memory_order_relaxed);
-            g_runTransfers.store(newVal, std::memory_order_relaxed);
-            if (!newVal) {
-                // Stop any in-flight waits quickly and release DAV.
-                g_abortWaits.store(true, std::memory_order_relaxed);
-                digitalWrite(PIN_DAV, HIGH);
-            } else {
-                g_abortWaits.store(false, std::memory_order_relaxed);
-            }
-            Serial.printf("Transfers %s (abort=%d)\n",
-                          newVal ? "ENABLED" : "PAUSED",
-                          (int)g_abortWaits.load(std::memory_order_relaxed));
+            const bool newVal = !g_hp.TransfersEnabled();
+            g_hp.SetTransfersEnabled(newVal);
+            Serial.printf("Transfers %s\n", newVal ? "ENABLED" : "PAUSED");
         } else if (!allowDestructive) {
             // Ignore everything else while inside handshake waits.
         } else if (c == 'd' || c == 'D') {
@@ -245,156 +175,42 @@ static void serviceSerialCommands(bool allowDestructive = true)
     }
 }
 
-// Timeouts (microseconds)
-static const uint32_t TIMEOUT_RFD_LOW_US  = 500000; // 0.5s
-static const uint32_t TIMEOUT_RFD_HIGH_US = 500000; // 0.5s
-
-static inline int rfd_raw() { return digitalRead(PIN_RFD); }
-static inline bool rfd_asserted()
+// Service callback used by the HPVectorDevice while waiting on handshake lines.
+static void serviceCommandsForWait()
 {
-    // "Asserted" means "ready".
-    return g_rfdActiveLow ? (rfd_raw() == 0) : (rfd_raw() != 0);
-}
-static inline bool rfd_deasserted() { return !rfd_asserted(); }
-
-static void writeDataBus15(uint16_t word)
-{
-    word &= 0x7FFF; // only D0..D14
-
-    // Bit-bang 15 GPIOs.
-    // This is intentionally straightforward for first bring-up.
-    for (int bit = 0; bit < 15; ++bit) {
-        const int pin = DATA_PINS[bit];
-        const int level = (word >> bit) & 1;
-        digitalWrite(pin, level);
-    }
+    serviceSerialCommands(false);
 }
 
-static bool waitForRfdAsserted(uint32_t timeout_us)
+// Move the beam without drawing (wrapper for vector count parity).
+static void hpMoveTo(uint16_t x, uint16_t y)
 {
-    const uint32_t start = micros();
-    uint32_t lastPrint = 0;
-    while (!rfd_asserted()) {
-        serviceSerialCommands(false);
-        if (g_abortWaits.load(std::memory_order_relaxed)) {
-            if (g_verbose.load(std::memory_order_relaxed)) {
-                Serial.println("Wait aborted (transfers paused).");
-            }
-            return false;
-        }
-        if ((micros() - start) > timeout_us) {
-            Serial.printf("Timeout waiting for RFD asserted, raw RFD=%d (active-%s)\n",
-                          rfd_raw(),
-                          g_rfdActiveLow ? "LOW" : "HIGH");
-            return false;
-        }
-        if (g_verbose.load(std::memory_order_relaxed)) {
-            uint32_t now = micros();
-            if (now - lastPrint > 250000) { // every 250ms
-                Serial.printf("Waiting for RFD asserted, raw RFD=%d (active-%s), elapsed=%lu us\n",
-                              rfd_raw(),
-                              g_rfdActiveLow ? "LOW" : "HIGH",
-                              now - start);
-                lastPrint = now;
-            }
-        }
-        delayMicroseconds(10);
-    }
-    return true;
+    g_hp.MoveTo(x, y);
 }
 
-static bool waitForRfdDeasserted(uint32_t timeout_us)
+// Draw a line and increment the per-frame vector count.
+static void hpLineTo(uint16_t x, uint16_t y)
 {
-    const uint32_t start = micros();
-    uint32_t lastPrint = 0;
-    while (!rfd_deasserted()) {
-        serviceSerialCommands(false);
-        if (g_abortWaits.load(std::memory_order_relaxed)) {
-            if (g_verbose.load(std::memory_order_relaxed)) {
-                Serial.println("Wait aborted (transfers paused).");
-            }
-            return false;
-        }
-        if ((micros() - start) > timeout_us) {
-            Serial.printf("Timeout waiting for RFD deasserted, raw RFD=%d (active-%s)\n",
-                          rfd_raw(),
-                          g_rfdActiveLow ? "LOW" : "HIGH");
-            return false;
-        }
-        if (g_verbose.load(std::memory_order_relaxed)) {
-            uint32_t now = micros();
-            if (now - lastPrint > 250000) { // every 250ms
-                Serial.printf("Waiting for RFD deasserted, raw RFD=%d (active-%s), elapsed=%lu us\n",
-                              rfd_raw(),
-                              g_rfdActiveLow ? "LOW" : "HIGH",
-                              now - start);
-                lastPrint = now;
-            }
-        }
-        delayMicroseconds(10);
-    }
-    return true;
+    g_hp.LineTo(x, y);
+    g_frameVectorCount++;
 }
 
-static bool sendOneWordImmediate(uint16_t word)
+// Draw text with explicit size/rotation through the device.
+static void drawTextAtSized(uint16_t x, uint16_t y, const char *text, uint8_t size, uint8_t rot)
 {
-    if (!g_runTransfers.load(std::memory_order_relaxed)) return false;
-
-    const bool trace = g_traceHandshake.load(std::memory_order_relaxed);
-    
-    // Wait until display indicates ready-for-data (RFD asserted)
-    if (trace) Serial.printf("Waiting for RFD asserted...\n");
-    if (!waitForRfdAsserted(TIMEOUT_RFD_LOW_US)) return false;
-
-    // Put data on bus BEFORE asserting DAV
-    if (trace) Serial.printf("RFD asserted, sending word 0x%04X\n", word);
-    writeDataBus15(word);
-
-    // Assert DAV low (data valid)
-    if (trace) Serial.printf("Asserting DAV low...\n");
-    digitalWrite(PIN_DAV, LOW);
-
-    // Wait for display to accept it (RFD deasserts)
-    if (trace) Serial.printf("Waiting for RFD deasserted...\n");
-    if (!waitForRfdDeasserted(TIMEOUT_RFD_HIGH_US)) {
-        if (trace) Serial.printf("RFD timeout, releasing DAV...\n");
-        digitalWrite(PIN_DAV, HIGH);
-        return false;
-    }
-
-    // Release DAV high to complete the transfer
-    if (trace) Serial.printf("RFD deasserted, releasing DAV...\n");
-    digitalWrite(PIN_DAV, HIGH);
-
-    return true;
+    g_hp.DrawTextAtSized(x, y, text, size, rot);
 }
 
-static bool sendWord(uint16_t word)
+// Draw 1X text through the device.
+static void drawTextAt(uint16_t x, uint16_t y, const char *text)
 {
-    const bool ok = sendOneWordImmediate(word);
-    if (ok) {
-        g_okCount++;
-        g_lastOkMs.store(millis(), std::memory_order_relaxed);
-        g_connected.store(true, std::memory_order_relaxed);
-    } else {
-        g_timeoutCount++;
-        const uint32_t lastOk = g_lastOkMs.load(std::memory_order_relaxed);
-        if (lastOk == 0 || (millis() - lastOk) > 1000) {
-            g_connected.store(false, std::memory_order_relaxed);
-        }
-        const uint32_t now = millis();
-        if (now - g_lastTimeoutReportMs > 1000) {
-            g_lastTimeoutReportMs = now;
-            Serial.println("TIMEOUT waiting for RFD transition. Check DISCONNECT SENSE=GND, RFD wiring, and divider.");
-        }
-    }
-    return ok;
+    g_hp.DrawTextAt(x, y, text);
 }
 
+// Periodically refresh the OLED status strip.
 static void ScreenThread()
 {
     while (true) {
-        const bool connected = g_connected.load(std::memory_order_relaxed);
+        const bool connected = g_hp.IsConnected();
         g_screen.Clear();
         g_screen.DrawBorder();
         g_screen.DrawStatus(connected);
@@ -403,65 +219,15 @@ static void ScreenThread()
     }
 }
 
-// HP1345A Plot-mode word builders.
-// X word: bits 14:12 = 000, bit 11 = pen (for upcoming Y), bits 10:0 = x coordinate
-// Y word: bit 14:13 = 00, bit 12 = 1, bit 11 = pen, bits 10:0 = y coordinate
-// HP1345A Plot-mode word builders (bits 14:13 = 00)
-// This mode drew the starburst correctly
-// g_penInvert flips pen sense for testing
-
-static inline uint16_t makeXWord(uint16_t x, bool penDown)
+// Convert a normalized coordinate to device space.
+static inline uint16_t coordMax() { return g_hp.CoordMax(); }
+static inline uint16_t clampCoord(int32_t v) { return g_hp.ClampCoord(v); }
+static inline uint16_t coordFromNorm(float n, uint16_t center, uint16_t radius)
 {
-    // Plot mode, X coordinate (bit12=0), pen bit on bit11, 11-bit coord
-    const bool pen = g_penInvert.load(std::memory_order_relaxed) ? !penDown : penDown;
-    const uint16_t penBit = pen ? 0x0800u : 0x0000u;
-    return penBit | (x & 0x07FFu);
+    return g_hp.CoordFromNorm(n, center, radius);
 }
 
-static inline uint16_t makeYWord(uint16_t y, bool penDown)
-{
-    // Plot mode, Y coordinate (bit12=1), pen bit (bit11), 11-bit coord
-    const bool pen = g_penInvert.load(std::memory_order_relaxed) ? !penDown : penDown;
-    const uint16_t penBit = pen ? 0x0800u : 0x0000u;
-    return 0x1000u | penBit | (y & 0x07FFu);
-}
-
-// HP1345A Text command word (bits 14:13 = 10 = 0x4000)
-// B12..B11 = S1..S0 (size), B10..B9 = R1..R0 (rotation),
-// B8 = ES (establish size/rotation), B7..B0 = character code
-static inline uint16_t makeTextWord(uint8_t ch, bool setSize, uint8_t size, uint8_t rot)
-{
-    const uint16_t s1 = (size >> 1) & 0x1;
-    const uint16_t s0 = size & 0x1;
-    const uint16_t r1 = (rot >> 1) & 0x1;
-    const uint16_t r0 = rot & 0x1;
-    return 0x4000u |
-           (s1 << 12) |
-           (s0 << 11) |
-           (r1 << 10) |
-           (r0 << 9)  |
-           (setSize ? 0x0100u : 0x0000u) |
-           (uint16_t)ch;
-}
-
-static void drawTextAtSized(uint16_t x, uint16_t y, const char *text, uint8_t size, uint8_t rot)
-{
-    if (!text || !*text) return;
-    moveTo(x, y);
-    bool first = true;
-    for (const char *p = text; *p; ++p) {
-        const uint8_t ch = (uint8_t)(*p);
-        sendWord(makeTextWord(ch, first, size, rot));
-        first = false;
-    }
-}
-
-static void drawTextAt(uint16_t x, uint16_t y, const char *text)
-{
-    // 1X size, 0° rotation
-    drawTextAtSized(x, y, text, 0, 0);
-}
-
+// Update the on-screen FPS/vector count text once per second.
 static void updateFpsText()
 {
     const uint32_t now = millis();
@@ -474,88 +240,15 @@ static void updateFpsText()
     if (dt >= 1000) {
         const float fps = (g_fpsFrames * 1000.0f) / (float)dt;
         const unsigned fpsInt = (unsigned)lroundf(fps);
-        snprintf(g_fpsText, sizeof(g_fpsText), "FPS:%u", fpsInt);
         snprintf(g_statsText, sizeof(g_statsText), "FPS:%u V:%lu", fpsInt, (unsigned long)g_lastVectorCount);
         g_fpsFrames = 0;
         g_fpsLastMs = now;
     }
 }
 
-// HP1345A Set Condition word (bits 14:13 = 11 = 0x6000)
-// Used to initialize display state (intensity, focus, etc.)
-// The test page sets these; we must replicate to get bright vectors.
-// Based on HP docs: bits 12:10 select parameter, bits 9:0 are value
-//   000 = intensity (0-1023, higher = brighter)
-//   001 = focus  
-//   010 = X offset
-//   011 = Y offset
-//   100 = writing rate (vector speed)
-static void initHP1345A()
-{
-    Serial.println("Initializing HP1345A display state...");
-    
-    // Try multiple intensity-related commands to maximize brightness
-    // Set Condition format: 0x6000 | (param << 10) | value
-    
-    // Intensity max (param 000, value 0x3FF)
-    sendWord(0x63FFu);
-    
-    // Also try setting all possible intensity values
-    // Maybe there's an additional brightness/blanking control
-    sendWord(0x6FFFu);  // Try with more bits set
-    
-    // Set focus to sharp (try higher value)
-    sendWord(0x67FFu);  // Focus param 001, max value
-    
-    // Set writing rate - slowest (minimum)
-    sendWord(0x7000u);
-    
-    // Move to origin to establish known position
-    sendWord(makeXWord(0, false));
-    sendWord(makeYWord(0, false));
-    
-    Serial.println("HP1345A initialized.");
-}
+// HP display init now lives inside HPVectorDevice.
 
-// Send X then Y. The Y word triggers the actual move or draw.
-// Track current position so lineTo can send both endpoints
-static uint16_t g_curX = 0;
-static uint16_t g_curY = 0;
-
-static void moveTo(uint16_t x, uint16_t y)
-{
-    sendWord(makeXWord(x, false));
-    sendWord(makeYWord(y, false));  // pen up = move
-    g_curX = x;
-    g_curY = y;
-}
-
-static void lineTo(uint16_t x, uint16_t y)
-{
-    // Send start point with pen up, then end point with pen down
-    sendWord(makeXWord(g_curX, false));
-    sendWord(makeYWord(g_curY, false));  // establish start point
-    sendWord(makeXWord(x, true));
-    sendWord(makeYWord(y, true));        // draw to end point
-    g_frameVectorCount++;
-    g_curX = x;
-    g_curY = y;
-}
-
-static inline uint16_t clampCoord(int32_t v)
-{
-    if (v < 0) return 0;
-    const uint16_t maxv = coordMax();
-    if (v > (int32_t)maxv) return maxv;
-    return (uint16_t)v;
-}
-
-static inline uint16_t coordFromNorm(float n, uint16_t center, uint16_t radius)
-{
-    const float v = (float)center + (n * (float)radius);
-    return clampCoord((int32_t)lroundf(v));
-}
-
+// TestCase0: square with diagonals.
 static void TestCase0()
 {
     // Square with an X
@@ -564,18 +257,19 @@ static void TestCase0()
     const uint16_t minv = m;
     const uint16_t maxv = maxc - m;
 
-    moveTo(minv, minv);
-    lineTo(maxv, minv);
-    lineTo(maxv, maxv);
-    lineTo(minv, maxv);
-    lineTo(minv, minv);
+    hpMoveTo(minv, minv);
+    hpLineTo(maxv, minv);
+    hpLineTo(maxv, maxv);
+    hpLineTo(minv, maxv);
+    hpLineTo(minv, minv);
 
-    moveTo(minv, minv);
-    lineTo(maxv, maxv);
-    moveTo(minv, maxv);
-    lineTo(maxv, minv);
+    hpMoveTo(minv, minv);
+    hpLineTo(maxv, maxv);
+    hpMoveTo(minv, maxv);
+    hpLineTo(maxv, minv);
 }
 
+// TestCase1: concentric squares.
 static void TestCase1()
 {
     // Concentric squares
@@ -588,14 +282,15 @@ static void TestCase1()
     for (uint16_t i = 0; i < steps; ++i) {
         const uint16_t minv = margin + (i * step);
         const uint16_t maxv = maxc - margin - (i * step);
-        moveTo(minv, minv);
-        lineTo(maxv, minv);
-        lineTo(maxv, maxv);
-        lineTo(minv, maxv);
-        lineTo(minv, minv);
+        hpMoveTo(minv, minv);
+        hpLineTo(maxv, minv);
+        hpLineTo(maxv, maxv);
+        hpLineTo(minv, maxv);
+        hpLineTo(minv, minv);
     }
 }
 
+// TestCase2: radial starburst.
 static void TestCase2()
 {
     // Starburst
@@ -610,11 +305,12 @@ static void TestCase2()
         const float a = twoPi * ((float)i / (float)rays);
         const uint16_t x = coordFromNorm(cosf(a), cx, r);
         const uint16_t y = coordFromNorm(sinf(a), cy, r);
-        moveTo(cx, cy);
-        lineTo(x, y);
+        hpMoveTo(cx, cy);
+        hpLineTo(x, y);
     }
 }
 
+// TestCase3: rectangular spiral.
 static void TestCase3()
 {
     // Rectangular spiral
@@ -625,29 +321,30 @@ static void TestCase3()
     uint16_t bottom = maxc - 60;
     const uint16_t step = 35;
 
-    moveTo(left, top);
+    hpMoveTo(left, top);
     while (left + step < right && top + step < bottom) {
-        lineTo(right, top);
-        lineTo(right, bottom);
-        lineTo(left, bottom);
+        hpLineTo(right, top);
+        hpLineTo(right, bottom);
+        hpLineTo(left, bottom);
         left += step;
         top += step;
         right -= step;
         bottom -= step;
-        lineTo(left, top);
+        hpLineTo(left, top);
     }
 }
 
+// TestCase4: grid of spinning 3D cubes.
 static void TestCase4()
 {
-    // Grid of spinning 3D cubes
+    // Grid of spinning 3D cubes.
     const uint16_t maxc = coordMax();
     const float cx = (float)maxc * 0.5f;
     const float cy = (float)maxc * 0.5f;
 
     const int cols = 4;
     const int rows = 3;
-    const int cubeCount = cols * rows; // 36 cubes -> 432 edges (vectors)
+    const int cubeCount = cols * rows; // 12 cubes -> 144 edges (vectors)
 
     const float gridW = (float)maxc * 0.675f;
     const float gridH = (float)maxc * 0.675f;
@@ -729,13 +426,14 @@ static void TestCase4()
                 const uint16_t y0 = clampCoord((int32_t)lroundf(a.y));
                 const uint16_t x1 = clampCoord((int32_t)lroundf(b.x));
                 const uint16_t y1 = clampCoord((int32_t)lroundf(b.y));
-                moveTo(x0, y0);
-                lineTo(x1, y1);
+                hpMoveTo(x0, y0);
+                hpLineTo(x1, y1);
             }
         }
     }
 }
 
+// TestCase5: ripple surface mesh.
 static void TestCase5()
 {
     // Ripple surface (animated mesh)
@@ -863,17 +561,18 @@ static void TestCase5()
     words.clear();
     words.reserve(segments.size() * 2);
     for (const Segment &s : segments) {
-        words.push_back({makeXWord(s.x0, false), makeYWord(s.y0, false)});
-        words.push_back({makeXWord(s.x1, true), makeYWord(s.y1, true)});
+        words.push_back({g_hp.MakeXWord(s.x0, false), g_hp.MakeYWord(s.y0, false)});
+        words.push_back({g_hp.MakeXWord(s.x1, true), g_hp.MakeYWord(s.y1, true)});
     }
 
     for (const WordPair &p : words) {
-        sendWord(p.xWord);
-        sendWord(p.yWord);
+        g_hp.SendWord(p.xWord);
+        g_hp.SendWord(p.yWord);
     }
     g_frameVectorCount += (uint32_t)segments.size();
 }
 
+// TestCase6: 3D starfield streaks.
 static void TestCase6()
 {
     // 3D starfield (N=200)
@@ -944,12 +643,13 @@ static void TestCase6()
             const uint16_t y0 = clampCoord((int32_t)lroundf(py));
             const uint16_t x1 = clampCoord((int32_t)lroundf(tx));
             const uint16_t y1 = clampCoord((int32_t)lroundf(ty));
-            moveTo(x0, y0);
-            lineTo(x1, y1);
+            hpMoveTo(x0, y0);
+            hpLineTo(x1, y1);
         }
     }
 }
 
+// TestCase7: spirograph pattern.
 static void TestCase7()
 {
     // Spirograph (hypotrochoid) pattern
@@ -993,14 +693,15 @@ static void TestCase7()
         const uint16_t sy = clampCoord((int32_t)lroundf(cy + yr * scale));
 
         if (first) {
-            moveTo(sx, sy);
+            hpMoveTo(sx, sy);
             first = false;
         } else {
-            lineTo(sx, sy);
+            hpLineTo(sx, sy);
         }
     }
 }
 
+// TestCase8: checkerboard outline.
 static void TestCase8()
 {
     // Checkerboard (outlined squares)
@@ -1018,16 +719,17 @@ static void TestCase8()
                 const uint16_t y0 = margin + (uint16_t)(r * cellH);
                 const uint16_t x1 = x0 + cellW;
                 const uint16_t y1 = y0 + cellH;
-                moveTo(x0, y0);
-                lineTo(x1, y0);
-                lineTo(x1, y1);
-                lineTo(x0, y1);
-                lineTo(x0, y0);
+                hpMoveTo(x0, y0);
+                hpLineTo(x1, y0);
+                hpLineTo(x1, y1);
+                hpLineTo(x0, y1);
+                hpLineTo(x0, y0);
             }
         }
     }
 }
 
+// TestCase9: Matrix-style falling characters.
 static void TestCase9()
 {
     // Matrix-style falling characters (smooth drift)
@@ -1102,6 +804,7 @@ static void TestCase9()
     }
 }
 
+// Dispatch the selected test pattern.
 static void RunTestCase(uint8_t idx)
 {
     static uint8_t lastIdx = 0xFF;
@@ -1126,33 +829,9 @@ static void RunTestCase(uint8_t idx)
     }
 }
 
-static void configurePins()
-{
-    // Data bus D0..D14: Outputs low idle
-    for (int i = 0; i < 15; ++i) {
-        pinMode(DATA_PINS[i], OUTPUT);
-        digitalWrite(DATA_PINS[i], LOW);
-    }
+// HP pin configuration now lives inside HPVectorDevice.
 
-    // DAV output, idle HIGH (inactive)
-    pinMode(PIN_DAV, OUTPUT);
-    digitalWrite(PIN_DAV, HIGH);
-
-    // RFD input (direct from HP, ESP32 is 5V tolerant - remove level shifter)
-    pinMode(PIN_RFD, INPUT);
-   
-    // Unused for now (but set safe if defined)
-    if (PIN_DS >= 0) {
-        pinMode(PIN_DS, INPUT);
-    }
-    if (PIN_RD >= 0) {
-        pinMode(PIN_RD, INPUT);
-    }
-    if (PIN_XACK >= 0) {
-        pinMode(PIN_XACK, INPUT);
-    }
-}
-
+// Arduino setup: initialize IO, OLED, and HP display.
 void setup()
 {
     Serial.begin(115200);
@@ -1166,7 +845,8 @@ void setup()
     Serial.println(" - Tie grounds together (HP GND to ESP32 GND)");
     Serial.println();
 
-    configurePins();
+    g_hp.SetServiceCallback(serviceCommandsForWait);
+    g_hp.ConfigurePins();
 
     Serial.println("Send 'd' to pulse DAV low for 500ms (wiring check on HP pin 10).");
     Serial.println("Send 's' to print bus status.");
@@ -1229,28 +909,28 @@ void setup()
     g_screenThread = std::thread(ScreenThread);
     g_screenThread.detach();
 
-    Serial.printf("DAV=%d (OUT), RFD=%d (IN)\n", PIN_DAV, PIN_RFD);
+    Serial.printf("DAV=%d (OUT), RFD=%d (IN)\n", kHpPins.dav, kHpPins.rfd);
     Serial.print("DATA pins D0..D14: ");
     for (int i = 0; i < 15; ++i) {
-        Serial.printf("%d%s", DATA_PINS[i], (i == 14) ? "\n" : ",");
+        Serial.printf("%d%s", kHpPins.data[i], (i == 14) ? "\n" : ",");
     }
 
-    Serial.printf("Initial RFD level = %d (0=ready/LOW)\n", digitalRead(PIN_RFD));
+    Serial.printf("Initial RFD level = %d (0=ready/LOW)\n", g_hp.RfdRaw());
     Serial.println("HP1345A Plot-mode word format: X word=0x0xxx, Y word=0x1yyy (pen=bit11)");
     
     // Initialize HP1345A display state (intensity, focus, etc.)
-    // This replicates what the built-in test page does.
-    initHP1345A();
+    g_hp.InitializeDisplay();
     
     Serial.println("Starting transfers...\n");
 }
 
+// Arduino loop: draw the active test pattern and overlay stats.
 void loop()
 {
     // Always service commands first (and frequently during waits).
     serviceSerialCommands(true);
 
-    if (g_runTransfers.load(std::memory_order_relaxed)) {
+    if (g_hp.TransfersEnabled()) {
         g_frameVectorCount = 0;
         RunTestCase(g_testIndex.load(std::memory_order_relaxed));
         g_lastVectorCount = g_frameVectorCount;
