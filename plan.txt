@@ -1,0 +1,224 @@
+Goal
+----
+Build an ESP32-S3-based interface for the HP 1345A vector display. A PC connects to the ESP32 via USB Serial.
+The PC sends RAW 16-bit words (packed exactly as the HP expects). The ESP32 replays them to the 1345A either:
+
+  Mode A: Immediate (base 1345A) using 2-wire handshake RFD/DAV
+  Mode B: Buffered (Option 704 vector memory) using DS/RD/WR (RFD/DAV not used)
+
+The design supports:
+  - setMode(immediate vs 704)
+  - sendWords(raw uint16_t words)
+  - commit(Once) : play one frame / load 704 once
+  - commit(Loop, refreshHz=60) : refresh repeatedly (immediate mode needs ~50–60 Hz refresh to prevent flicker)
+  - clear()
+
+IMPORTANT REFS (HP manual)
+--------------------------
+Rear 26-pin digital interface connector pinout:
+  Pin 1  SYNC     Pin 2  NC
+  Pin 3  RD       Pin 4  XACK
+  Pin 5  DS       Pin 6  NC
+  Pin 7  DISCONNECT SENSE  Pin 8  RFD
+  Pin 9  D14      Pin 10 DAV/WR
+  Pin 11 D12      Pin 12 D13
+  Pin 13 D10      Pin 14 D11
+  Pin 15 D08      Pin 16 D09
+  Pin 17 D06      Pin 18 D07
+  Pin 19 D04      Pin 20 D05
+  Pin 21 D02      Pin 22 D03
+  Pin 23 D00      Pin 24 D01
+  Pin 25 GND      Pin 26 GND
+
+Immediate-mode handshake (active low):
+  - Display asserts RFD LOW when ready
+  - Host asserts DAV LOW when data valid (after placing data on bus)
+  - Display deasserts RFD HIGH to indicate accepted
+  - Host deasserts DAV HIGH to complete transfer
+Rules:
+  - Do not assert DAV before RFD is low
+  - Display will not drop RFD again unless DAV is high
+  - Keep DAV low as short as possible; while DAV low, display won't act on the command even if accepted
+
+Option 704 (vector memory) mode:
+  - Uses DS + RD/WR lines
+  - RFD/DAV not used when 704 active
+  - XACK/ACK indicates completion but can be ignored if write rate is comfortably below ~1.77 MHz
+  - Address pointer auto-increments after reads/writes
+
+Hardware Safety / Electrical Notes
+----------------------------------
+1) DISCONNECT SENSE MUST be tied to GND or the display shows internal verification/test pattern instead of external data.
+2) ESP32-S3 GPIO are 3.3V. Driving HP TTL inputs at 3.3V may work but is not guaranteed without VIH specs.
+   - Start without level shifting for outputs (experiment).
+   - ALWAYS protect ESP32 inputs from possible 5V from HP.
+3) Protect RFD (and XACK if used) into ESP32 using resistor divider:
+   Example: HP signal -> 10k -> ESP32 GPIO, ESP32 GPIO -> 20k -> GND (scales 5V to ~3.3V).
+4) Common ground between HP (pins 25/26) and ESP32.
+5) Ribbon cable length is ~1 foot (good). Manual guidance: <= 6 feet.
+
+ESP32 Board
+-----------
+Heltec / HiLetgo style ESP32-S3 WiFi Kit 32 V3 (ESP32-S3FN8 dual core).
+Available pins labeled on underside; top edge also exposes 35..39 etc.
+
+Final ESP32-S3 Pin Mapping (as used in bring-up sketch)
+-------------------------------------------------------
+Immediate-mode required:
+  DAV/WR (HP pin 10) -> ESP32 GPIO35 (OUT)   [DAV in immediate mode]
+  RFD    (HP pin 8)  -> ESP32 GPIO36 (IN)    [via divider]
+  DISCONNECT SENSE (HP pin 7) -> GND
+  GND (HP pin 25/26) -> ESP32 GND
+
+Data bus D0..D14 -> ESP32 GPIOs:
+  D0  -> GPIO2
+  D1  -> GPIO3
+  D2  -> GPIO4
+  D3  -> GPIO5
+  D4  -> GPIO6
+  D5  -> GPIO7
+  D6  -> GPIO10
+  D7  -> GPIO11
+  D8  -> GPIO12
+  D9  -> GPIO13
+  D10 -> GPIO14
+  D11 -> GPIO15
+  D12 -> GPIO16
+  D13 -> GPIO18
+  D14 -> GPIO26
+
+704-mode additional lines (wired now, used later):
+  DS   (HP pin 5) -> ESP32 GPIO37 (OUT)
+  RD   (HP pin 3) -> ESP32 GPIO38 (OUT)
+  XACK (HP pin 4) -> ESP32 GPIO39 (IN) [via divider]
+
+Note: SYNC (pin 1) not currently used.
+
+Software Architecture
+---------------------
+Create an HP1345ADevice class that abstracts the low-level bus and handshake.
+
+Core types:
+  enum class Mode { Immediate, Buffered704 };
+  enum class CommitMode { Once, Loop };
+
+HP1345ADevice public API:
+  - void setMode(Mode m);
+  - void clear();                       // clears staging/active lists
+  - void sendWords(span<const uint16_t> words); // append to staging list
+  - void commit(CommitMode cm, uint16_t refreshHz=60);
+
+Internals:
+  - Two buffers (double buffering):
+      stagingWords: vector<uint16_t>
+      activeWords: vector<uint16_t>
+    commit() swaps activeWords <- stagingWords (atomically or with mutex)
+  - Render task:
+      if mode==Immediate and loop enabled:
+          replay activeWords at refreshHz (default ~60)
+      if mode==Immediate and once:
+          replay once then stop
+      if mode==Buffered704:
+          write activeWords into 704 memory on commit once (and optionally loop for test)
+  - USB ingest task:
+      reads framed packets and updates stagingWords; triggers commit.
+
+PC <-> ESP32 Protocol (binary framing)
+--------------------------------------
+Send RAW 16-bit word payloads. Recommended framing:
+
+  SYNC: 0xA5 0x5A
+  CMD:  1 byte
+  LEN:  2 bytes (number of uint16_t words)
+  PAYLOAD: LEN * 2 bytes (little-endian uint16_t)
+  CRC16: optional (add once basic comms stable)
+
+Commands:
+  0x01 REPLACE_LIST    (payload=words; staging = payload)
+  0x02 APPEND_LIST     (payload=words; staging += payload)
+  0x03 CLEAR           (no payload)
+  0x04 SET_MODE        (payload: 1 word; 0=Immediate, 1=Buffered704)
+  0x05 COMMIT_ONCE     (no payload)
+  0x06 COMMIT_LOOP     (payload: 1 word; refreshHz, e.g. 60; 0=as fast as possible)
+  0x07 STOP_LOOP       (no payload)
+
+All words are raw HP-format 16-bit words; ESP32 does not interpret them (at least initially).
+
+Immediate-mode Low-level Send Function (RFD/DAV)
+------------------------------------------------
+sendWordImmediate(uint16_t word):
+  1) wait until RFD == LOW (ready)
+  2) drive data bus D0..D14 with (word & 0x7FFF) (ignore bit 15 unless later needed)
+  3) assert DAV LOW
+  4) wait until RFD == HIGH (accepted)
+  5) deassert DAV HIGH
+
+Time-outs:
+  - wait RFD low with timeout (e.g., 0.5s)
+  - wait RFD high with timeout (e.g., 0.5s)
+On timeout, always release DAV high to avoid wedging the bus.
+
+704-mode Low-level Write Outline (DS/WR)
+----------------------------------------
+NOTE: finalize after immediate mode verified.
+Basic concept (no reads initially):
+  - Assert DS LOW to select vector memory
+  - Set A0 appropriately if addressing pointer/register is required (A0 not on connector per current pinout; confirm in manual section)
+  - Place word on bus (likely 16-bit if D15 is accessible; otherwise 15-bit path for base interface only—verify on actual 704 wiring)
+  - Pulse WR LOW then HIGH
+  - Optionally wait XACK LOW then HIGH (or just delay small fixed time well below 1.77 MHz rate)
+  - Deassert DS HIGH when done
+
+Bring-up / Test Plan
+--------------------
+Stage 1: Hardware handshake validation (Immediate mode only)
+  - Wire D0..D14, DAV, RFD, DISCONNECT SENSE=GND, grounds.
+  - Run "handshake exerciser" sketch:
+      repeatedly sends a constant test word, prints ok/timeouts, flips pattern.
+  - Validate with scope/logic analyzer: DAV pulses cause RFD transitions.
+
+Stage 2: USB protocol + list/commit
+  - Implement framed protocol above.
+  - Support REPLACE, APPEND, CLEAR, COMMIT ONCE, COMMIT LOOP, STOP LOOP.
+
+Stage 3: Real HP command words
+  - Use PC-side code to generate correct HP words for SET/PLOT/GRAPH/TEXT.
+  - Start with known-good sequences from PHK Wargames page (PC does translation to words).
+
+Stage 4: Option 704 buffered mode
+  - Wire DS/RD/WR/XACK; implement load-to-vector-memory on commit.
+  - Add CLI option on PC tool: --mode immediate|704
+  - Verify 704 behavior: does picture persist without host refresh? confirm.
+
+PlatformIO / Build
+------------------
+platformio.ini:
+  [env:heltec_wifi_kit_32_v3]
+  platform = espressif32
+  board = heltec_wifi_kit_32_v3
+  framework = arduino
+  monitor_speed = 115200
+  monitor_filters = esp32_exception_decoder
+
+Current Bring-up Sketch (Immediate-mode handshake exerciser)
+------------------------------------------------------------
+Already created in src/main.cpp in prior step:
+  - Uses ESP-IDF gpio driver for speed/clarity.
+  - Drives D0..D14, toggles DAV, reads RFD with timeout, prints ok/timeouts.
+
+Notes / Gotchas
+---------------
+- If RFD never goes LOW:
+    - DISCONNECT SENSE not grounded
+    - wrong pin wiring
+    - missing common ground
+    - divider wiring wrong
+- If you see sporadic timeouts:
+    - borderline 3.3V HIGH recognition at HP inputs; add HCT level shifting for outputs
+    - noise/grounding; shorten ribbon; add series resistors (e.g., 33–68 ohm) on fast edges
+- Keep DAV pulses short; do not "hold" DAV low between words.
+
+End.
+"""
+Path("/mnt/data/plan.txt").write_text(plan, encoding="utf-8")
+"/mnt/data/plan.txt"
