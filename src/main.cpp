@@ -95,6 +95,7 @@ static std::atomic<bool> g_verbose{false};
 static std::atomic<bool> g_traceHandshake{false};
 static std::atomic<bool> g_echoRx{false};
 static std::atomic<uint8_t> g_testIndex{0};
+static std::atomic<bool> g_starfieldReset{true};
 static uint32_t g_fpsFrames = 0;
 static uint32_t g_fpsLastMs = 0;
 static char g_fpsText[16] = "FPS:0";
@@ -886,18 +887,17 @@ static void TestCase6()
     const float cx = (float)maxc * 0.5f;
     const float cy = (float)maxc * 0.5f;
 
-    const int kStarCount = 200;
+    const int kStarCount = 400;
     const float fieldRadius = 0.25f;   // wider emission cone
     const float zNear = 0.1f;
     const float zFar = 2.0f;
     const float speed = 1.25f;        // depth units per second (2x faster)
     const float focal = (float)maxc * 1.4f;
 
-    static bool initialized = false;
     static std::vector<Star> stars;
     static uint32_t lastMs = 0;
 
-    if (!initialized) {
+    if (g_starfieldReset.exchange(false, std::memory_order_relaxed) || stars.size() != kStarCount) {
         stars.resize(kStarCount);
         for (int i = 0; i < kStarCount; ++i) {
             stars[i].x = (random(-1000, 1000) / 1000.0f) * fieldRadius;
@@ -905,7 +905,6 @@ static void TestCase6()
             stars[i].z = zNear + (random(0, 1000) / 1000.0f) * (zFar - zNear);
         }
         lastMs = millis();
-        initialized = true;
     }
 
     const uint32_t now = millis();
@@ -925,11 +924,28 @@ static void TestCase6()
         const float py = cy + (s.y * focal) / s.z;
 
         if (px >= 0.0f && px <= (float)maxc && py >= 0.0f && py <= (float)maxc) {
-            const uint16_t sx = clampCoord((int32_t)lroundf(px));
-            const uint16_t sy = clampCoord((int32_t)lroundf(py));
-            // Draw as a tiny streak to suggest motion
-            moveTo(sx, sy);
-            lineTo(sx, clampCoord((int32_t)(sy + 1)));
+            const float depthT = (zFar - s.z) / (zFar - zNear); // 0..1, near = 1
+            const float minTrail = 1.0f;
+            const float maxTrail = 50.0f;
+            const float trailLen = minTrail + (maxTrail - minTrail) * depthT;
+
+            float dx = cx - px;
+            float dy = cy - py;
+            const float dist = sqrtf(dx * dx + dy * dy);
+            if (dist > 0.001f) {
+                dx /= dist;
+                dy /= dist;
+            }
+
+            const float tx = px + dx * trailLen;
+            const float ty = py + dy * trailLen;
+
+            const uint16_t x0 = clampCoord((int32_t)lroundf(px));
+            const uint16_t y0 = clampCoord((int32_t)lroundf(py));
+            const uint16_t x1 = clampCoord((int32_t)lroundf(tx));
+            const uint16_t y1 = clampCoord((int32_t)lroundf(ty));
+            moveTo(x0, y0);
+            lineTo(x1, y1);
         }
     }
 }
@@ -1088,6 +1104,13 @@ static void TestCase9()
 
 static void RunTestCase(uint8_t idx)
 {
+    static uint8_t lastIdx = 0xFF;
+    if (idx != lastIdx) {
+        if (idx == 6) {
+            g_starfieldReset.store(true, std::memory_order_relaxed);
+        }
+        lastIdx = idx;
+    }
     switch (idx) {
         case 0: TestCase0(); break;
         case 1: TestCase1(); break;
