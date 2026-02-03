@@ -937,11 +937,15 @@ static void pollConsoleInput()
 // ------------------------------------------------------------
 // Arduino setup/loop
 // ------------------------------------------------------------
+
+// Serial baud rate - must match client hptest.py and platformio.ini monitor_speed
+static constexpr uint32_t kSerialBaud = 921600;
+
 void setup()
 {
     // Increase RX buffer to handle large packets at high baud rate
     Serial.setRxBufferSize(8192);
-    Serial.begin(921600);
+    Serial.begin(kSerialBaud);
     delay(100);
 
     g_hp.SetQuiet(true);

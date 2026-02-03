@@ -20,6 +20,9 @@ from typing import Callable, List, Optional
 
 import serial
 
+# Serial baud rate - must match ESP32 Serial.begin() and platformio.ini monitor_speed
+BAUD_RATE = 921600
+
 PREAMBLE = bytes([0xA5, 0x5A, 0xC3, 0x3C])
 
 CMD_WRITE_WORDS = 0x01
@@ -224,7 +227,7 @@ def test_4(b: VectorBuilder, t: float) -> None:
         x, y = x * caz - y * saz, x * saz + y * caz
         return x, y, z
 
-    cube_size = MAXC * 0.06
+    cube_size = MAXC * 0.12
     focal = MAXC * 1.4
     zoff = MAXC * 2.2
 
@@ -256,11 +259,11 @@ def test_5(b: VectorBuilder, t: float) -> None:
     step = 1.0
     tilt = 0.65
     cosx, sinx = math.cos(tilt), math.sin(tilt)
-    scale = 100.0
+    scale = 80.0
 
     def height(x: float, y: float) -> float:
         r = math.hypot(x, y)
-        return math.cos(r * 0.65 - t * 2.5) * math.exp(-r * 0.12) * 5.0
+        return math.cos(r * 0.65 - t * 2.5) * math.exp(-r * 0.12) * 10.0
 
     xs = [x for x in frange(-half, half, step)]
     ys = [y for y in frange(-half, half, step)]
@@ -342,7 +345,7 @@ def test_7(b: VectorBuilder, t: float) -> None:
     span = (R - r) + d
     scale = (MAXC * 0.42) / span
 
-    spin = t * 0.6
+    spin = t * 1.8
     cos_s, sin_s = math.cos(spin), math.sin(spin)
     first = True
     for i in range(segments + 1):
@@ -505,7 +508,7 @@ def print_status(message: str) -> None:
 
 
 def run_ui(port: str, hz: int) -> None:
-    ser = serial.Serial(port, 921600, timeout=0.05)
+    ser = serial.Serial(port, BAUD_RATE, timeout=0.05)
     console_mode = threading.Event()
     running = True
 
@@ -534,9 +537,7 @@ def run_ui(port: str, hz: int) -> None:
     current = 0
     
     # Bandwidth-adaptive animation
-    # At 921600 baud 8N1: ~92160 bytes/sec max throughput
-    # Leave 20% headroom for timing jitter: ~73KB/s usable
-    BAUD_RATE = 921600
+    # Leave 20% headroom for timing jitter
     BYTES_PER_SEC = BAUD_RATE // 10  # 8N1 = 10 bits per byte
     USABLE_BW = int(BYTES_PER_SEC * 0.80)  # 80% to leave headroom
     
@@ -567,11 +568,9 @@ def run_ui(port: str, hz: int) -> None:
             while True:
                 now = time.time()
                 if animation_on and now >= next_frame and not console_mode.is_set():
-                    anim_t = now
-                    words = build_words(current, anim_t)
+                    words = build_words(current, now)
                     send_words(ser, words)
-                    commit_loop(ser, 0)  # Atomic swap, keep looping
-                    ser.flush()
+                    commit_loop(ser, 0)
                     next_frame = time.time() + frame_interval
                 time.sleep(0.002)
         finally:
@@ -586,12 +585,11 @@ def run_ui(port: str, hz: int) -> None:
             rlist, _, _ = select.select([sys.stdin], [], [], 0.01)
             now = time.time()
             if animation_on and now >= next_frame and not console_mode.is_set():
-                anim_t = now
-                words = build_words(current, anim_t)
+                words = build_words(current, now)
                 send_words(ser, words)
-                commit_loop(ser, 0)  # Atomic swap, keep looping
-                ser.flush()
+                commit_loop(ser, 0)
                 next_frame = time.time() + frame_interval
+                    
             if not rlist:
                 continue
             ch = sys.stdin.read(1)
