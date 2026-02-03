@@ -10,6 +10,7 @@
 #include <vector>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_task_wdt.h"
 #include "screen.h"
 
 // ------------------------------------------------------------
@@ -301,11 +302,13 @@ static void swapStagingToActive()
     if (!g_swapEnabled.load(std::memory_order_relaxed))
         return;
     
-    // Copy staging to new shared_ptr (hold staging mutex briefly)
+    // Move staging to new active (no copy - just pointer transfer)
     std::shared_ptr<std::vector<uint16_t>> newActive;
     {
         std::lock_guard<std::mutex> lock(g_stagingMutex);
-        newActive = std::make_shared<std::vector<uint16_t>>(g_staging);
+        // Move the staging vector contents to new shared_ptr (no data copy)
+        newActive = std::make_shared<std::vector<uint16_t>>(std::move(g_staging));
+        g_staging.clear();  // Reset staging for next frame
     }
     // Swap active pointer (hold active mutex very briefly)
     {
@@ -663,6 +666,7 @@ static void pollConsoleInput();
 static void SerialTask(void *param)
 {
     (void)param;
+    
     while (true)
     {
         const UIMode mode = g_mode.load(std::memory_order_relaxed);
@@ -674,7 +678,7 @@ static void SerialTask(void *param)
             int avail = Serial.available();
             if (avail > 0)
             {
-                int yieldCount = 0;
+                // Process all currently available bytes in one burst
                 while (avail > 0)
                 {
                     const uint8_t b = (uint8_t)Serial.read();
@@ -684,6 +688,9 @@ static void SerialTask(void *param)
                     g_parser.ProcessByte(b);
                     avail--;
                 }
+                // Yield after processing batch to let IDLE0 feed watchdog
+                // At 921600 baud (~92 bytes/ms) with 8KB buffer, 1ms delay is safe
+                vTaskDelay(1);
             }
             else
             {
@@ -976,7 +983,7 @@ void setup()
         "SerialTask",
         8192,
         nullptr,
-        4,  // Higher priority to drain serial buffer
+        9,  // Higher priority to drain serial buffer
         &g_serialTask,
         0); // Core 0 - dedicated to serial
 

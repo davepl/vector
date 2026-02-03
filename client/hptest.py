@@ -252,11 +252,11 @@ def test_4(b: VectorBuilder, t: float) -> None:
 
 def test_5(b: VectorBuilder, t: float) -> None:
     # Ripple/sombrero mesh (static).
-    half = 8.0
-    step = 1.25
+    half = 10.0
+    step = 1.0
     tilt = 0.65
     cosx, sinx = math.cos(tilt), math.sin(tilt)
-    scale = 125.0
+    scale = 100.0
 
     def height(x: float, y: float) -> float:
         r = math.hypot(x, y)
@@ -302,6 +302,7 @@ def test_0(b: VectorBuilder, t: float) -> None:
     focal = MAXC * 1.2
     z_near, z_far = 0.2, 2.0
     count = 100
+    margin = 50  # Buffer zone before recycling
     for _ in range(count):
         angle = random.random() * 2 * math.pi
         radius = random.random() * 0.25
@@ -312,6 +313,11 @@ def test_0(b: VectorBuilder, t: float) -> None:
         z = z_near + ((base_z - t * 0.5) % 1.0) * (z_far - z_near)
         px = cx + (x * focal) / z
         py = cy + (y * focal) / z
+        
+        # Skip stars that have gone off screen - they'll recycle naturally via z wrap
+        if px < -margin or px > MAXC + margin or py < -margin or py > MAXC + margin:
+            continue
+            
         trail = 1 + (1.0 - (z - z_near) / (z_far - z_near)) * 48
         dx = cx - px
         dy = cy - py
@@ -527,17 +533,33 @@ def run_ui(port: str, hz: int) -> None:
     print_help()
     current = 0
     
-    # Animation: 30 FPS, ON by default. Press 'a' to toggle.
-    anim_fps = 30
-    frame_interval = 1.0 / anim_fps
-    next_frame = time.time()
+    # Bandwidth-adaptive animation
+    # At 921600 baud 8N1: ~92160 bytes/sec max throughput
+    # Leave 20% headroom for timing jitter: ~73KB/s usable
+    BAUD_RATE = 921600
+    BYTES_PER_SEC = BAUD_RATE // 10  # 8N1 = 10 bits per byte
+    USABLE_BW = int(BYTES_PER_SEC * 0.80)  # 80% to leave headroom
+    
     animation_on = True
+    next_frame = time.time()
+    
+    def calc_frame_interval(num_words: int) -> float:
+        """Calculate minimum frame interval based on bandwidth."""
+        # Bytes per frame: payload + overhead (preamble, header, CRC)
+        bytes_per_frame = num_words * 2 + 20  # ~20 bytes overhead
+        if bytes_per_frame <= 0:
+            return 1.0 / 60  # Default 60 FPS for empty frames
+        max_fps = USABLE_BW / bytes_per_frame
+        max_fps = min(max_fps, 60)  # Cap at 60 FPS
+        max_fps = max(max_fps, 1)   # Floor at 1 FPS
+        return 1.0 / max_fps
     
     # Send first frame immediately
     words = build_words(current, time.time())
     send_words(ser, words)
     commit_loop(ser, 0)  # hz=0 means play as fast as possible (immediate swap)
-    print_status(f"Sent test {current} ({len(words)} words), animation ON")
+    frame_interval = calc_frame_interval(len(words))
+    print_status(f"Sent test {current} ({len(words)} words), animation ON, max {1.0/frame_interval:.0f} FPS")
 
     if not sys.stdin.isatty():
         write_console("stdin is not a TTY; running headless. Use Ctrl+C to exit.")
@@ -587,7 +609,8 @@ def run_ui(port: str, hz: int) -> None:
                 words = build_words(current, time.time())
                 send_words(ser, words)
                 commit_loop(ser, 0)
-                print_status(f"Sent test {current} ({len(words)} words)")
+                frame_interval = calc_frame_interval(len(words))
+                print_status(f"Sent test {current} ({len(words)} words), max {1.0/frame_interval:.0f} FPS")
                 continue
             if ch in "nN":
                 current = (current + 1) % 10
@@ -598,13 +621,14 @@ def run_ui(port: str, hz: int) -> None:
                 words = build_words(current, time.time())
                 send_words(ser, words)
                 commit_loop(ser, 0)
-                print_status(f"Sent test {current} ({len(words)} words)")
+                frame_interval = calc_frame_interval(len(words))
+                print_status(f"Sent test {current} ({len(words)} words), max {1.0/frame_interval:.0f} FPS")
                 continue
             if ch in "aA":
                 animation_on = not animation_on
                 if animation_on:
                     next_frame = time.time()
-                    print_status("Animation ON (adaptive FPS)")
+                    print_status(f"Animation ON (max {1.0/frame_interval:.0f} FPS)")
                 else:
                     print_status("Animation OFF")
                 continue
