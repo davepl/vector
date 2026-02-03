@@ -78,9 +78,10 @@ static size_t activeWordCount()
 }
 
 static std::atomic<bool> g_loopEnabled{false};
+static std::atomic<bool> g_swapEnabled{true};  // DEBUG: 'd' key toggles this
 static std::atomic<uint16_t> g_loopHz{60};
 static std::atomic<uint32_t> g_lastLoopMs{0};
-static std::atomic<uint32_t> g_lastFrameMs{0};
+static std::atomic<uint32_t> g_lastFrameUs{0};  // Microseconds for accurate FPS
 static std::atomic<UIMode> g_mode{UIMode::Binary};
 
 // Escape detection (pause +++ pause)
@@ -189,13 +190,17 @@ static bool playbackActiveOnce()
         local = g_active;
     }
 
-    // Calculate FPS for stats overlay
-    const uint32_t nowMs = millis();
-    const uint32_t lastMs = g_lastFrameMs.exchange(nowMs);
+    // Calculate FPS for stats overlay using microseconds for accuracy
+    const uint32_t nowUs = (uint32_t)esp_timer_get_time();
+    const uint32_t lastUs = g_lastFrameUs.exchange(nowUs);
     uint32_t fps_x10 = 0;
-    if (lastMs > 0 && nowMs > lastMs)
+    if (lastUs > 0 && nowUs > lastUs)
     {
-        fps_x10 = 10000u / (nowMs - lastMs);
+        const uint32_t deltaUs = nowUs - lastUs;
+        if (deltaUs > 0)
+        {
+            fps_x10 = 10000000u / deltaUs;  // 10M / deltaUs gives FPS * 10
+        }
     }
 
     // Calculate vectors per frame and per second
@@ -289,9 +294,15 @@ static void LoopTask(void *param)
 // ------------------------------------------------------------
 static void swapStagingToActive()
 {
+    // Always count received frames for Rx stat
+    g_stats.frames_received.fetch_add(1, std::memory_order_relaxed);
+    
+    // DEBUG: If swap disabled, don't actually swap (to test if swapping causes flicker)
+    if (!g_swapEnabled.load(std::memory_order_relaxed))
+        return;
+        
     std::lock_guard<std::mutex> lock(g_bufMutex);
     g_active = std::make_shared<std::vector<uint16_t>>(g_staging);
-    g_stats.frames_received.fetch_add(1, std::memory_order_relaxed);
 }
 
 static void clearBuffers(bool clearActive, bool clearStaging)
@@ -493,6 +504,13 @@ private:
             (void)modeWord;
             break;
         }
+        case 0x08: // DEBUG: Toggle swap enable
+        {
+            bool newState = !g_swapEnabled.load(std::memory_order_relaxed);
+            g_swapEnabled.store(newState, std::memory_order_relaxed);
+            Serial.printf("\n*** SWAP %s ***\n", newState ? "ENABLED" : "DISABLED");
+            break;
+        }
         default:
             break;
         }
@@ -520,7 +538,7 @@ private:
             std::lock_guard<std::mutex> lock(g_bufMutex);
             if (replace)
             {
-                g_staging = words;
+                g_staging = std::move(words);  // Move, don't copy
             }
             else
             {
@@ -608,9 +626,8 @@ static void ScreenTask(void *param)
         const uint32_t vecPerSec = (uint32_t)((vecPerFrame * (uint64_t)fps_x10) / 10u);
         snprintf(g_modeLine, sizeof(g_modeLine), "Mode: %s",
                  (mode == UIMode::Binary) ? "Binary" : "Console");
-        snprintf(g_fpsLine, sizeof(g_fpsLine), "FPS: %lu.%lu",
-                 (unsigned long)(fps_x10 / 10u),
-                 (unsigned long)(fps_x10 % 10u));
+        snprintf(g_fpsLine, sizeof(g_fpsLine), "FPS: %lu",
+                 (unsigned long)(round(fps_x10 / 10.0)));
         snprintf(g_vecLine, sizeof(g_vecLine), "Vec/s: %lu",
                  (unsigned long)vecPerSec);
 
@@ -648,6 +665,7 @@ static void SerialTask(void *param)
                 {
                     const uint8_t b = (uint8_t)Serial.read();
                     const uint32_t tnow = millis();
+                    
                     feedEscapeDetector(b, tnow);
                     g_parser.ProcessByte(b);
                     avail--;
@@ -925,7 +943,7 @@ void setup()
             1); // Core 1
     }
 
-    // Start drawing/loop task on Core 0
+    // Start drawing/loop task on Core 1 - completely isolated from serial
     xTaskCreatePinnedToCore(
         LoopTask,
         "LoopTask",
@@ -933,17 +951,17 @@ void setup()
         nullptr,
         2,  // Medium priority for rendering
         &g_loopTask,
-        0); // Core 0
+        1); // Core 1 - dedicated to drawing
 
-    // Start serial task on Core 0 - HIGHER priority to prevent buffer overflow
+    // Start serial task on Core 0 - handles all serial I/O
     xTaskCreatePinnedToCore(
         SerialTask,
         "SerialTask",
         8192,
         nullptr,
-        4,  // Higher priority than LoopTask to drain serial buffer
+        4,  // Higher priority to drain serial buffer
         &g_serialTask,
-        0); // Core 0
+        0); // Core 0 - dedicated to serial
 
     resetEscapeDetector();
     g_parser.Reset();

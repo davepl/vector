@@ -28,6 +28,7 @@ CMD_CLEAR = 0x03
 CMD_COMMIT_ONCE = 0x04
 CMD_COMMIT_LOOP = 0x05
 CMD_STOP_LOOP = 0x06
+CMD_TOGGLE_SWAP = 0x08  # DEBUG: Toggle swap enable on ESP32
 
 MAXC = 2047
 
@@ -606,6 +607,11 @@ def run_ui(port: str, hz: int) -> None:
                     print_status("Animation ON (adaptive FPS)")
                 else:
                     print_status("Animation OFF")
+                continue
+            if ch in "dD":
+                # Send CMD_TOGGLE_SWAP command to ESP32
+                ser.write(pack_packet(CMD_TOGGLE_SWAP, [], with_crc=True))
+                print_status("Sent toggle swap command")
                 continue
 
             # Pass-through to ESP32 (for +++ and console commands).
