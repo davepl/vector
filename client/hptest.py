@@ -254,12 +254,16 @@ def test_4(b: VectorBuilder, t: float) -> None:
 
 
 def test_5(b: VectorBuilder, t: float) -> None:
-    # Ripple/sombrero mesh (static).
+    # Ripple/sombrero mesh - spinning like a sombrero hat.
     half = 10.0
     step = 1.0
     tilt = 0.65
     cosx, sinx = math.cos(tilt), math.sin(tilt)
     scale = 80.0
+    
+    # Rotation around vertical axis (spin)
+    spin = t * 0.8
+    cos_spin, sin_spin = math.cos(spin), math.sin(spin)
 
     def height(x: float, y: float) -> float:
         r = math.hypot(x, y)
@@ -272,9 +276,13 @@ def test_5(b: VectorBuilder, t: float) -> None:
     for y in ys:
         first = True
         for x in xs:
-            z = height(x, y)
-            yt = y * cosx - z * sinx
-            px = MAXC * 0.5 + x * scale
+            # Rotate x,y around center before computing height
+            xr = x * cos_spin - y * sin_spin
+            yr = x * sin_spin + y * cos_spin
+            z = height(xr, yr)
+            # Apply tilt (rotation around X axis for 3D view)
+            yt = yr * cosx - z * sinx
+            px = MAXC * 0.5 + xr * scale
             py = MAXC * 0.5 + yt * scale
             if first:
                 b.move_to(clamp(px), clamp(py))
@@ -286,9 +294,13 @@ def test_5(b: VectorBuilder, t: float) -> None:
     for x in xs:
         first = True
         for y in ys:
-            z = height(x, y)
-            yt = y * cosx - z * sinx
-            px = MAXC * 0.5 + x * scale
+            # Rotate x,y around center before computing height
+            xr = x * cos_spin - y * sin_spin
+            yr = x * sin_spin + y * cos_spin
+            z = height(xr, yr)
+            # Apply tilt (rotation around X axis for 3D view)
+            yt = yr * cosx - z * sinx
+            px = MAXC * 0.5 + xr * scale
             py = MAXC * 0.5 + yt * scale
             if first:
                 b.move_to(clamp(px), clamp(py))
