@@ -54,7 +54,8 @@ static Stats g_stats;
 // Active buffer is what the drawing task renders (atomically swapped).
 static std::vector<uint16_t> g_staging;
 static std::shared_ptr<std::vector<uint16_t>> g_active;
-static std::mutex g_bufMutex;
+static std::mutex g_stagingMutex;  // Protects g_staging only
+static std::mutex g_activeMutex;   // Protects g_active only (very brief holds)
 
 // FreeRTOS task handles
 static TaskHandle_t g_screenTask = nullptr;
@@ -73,7 +74,7 @@ static std::atomic<uint64_t> g_totalVectorsDrawn{0};
 
 static size_t activeWordCount()
 {
-    std::lock_guard<std::mutex> lock(g_bufMutex);
+    std::lock_guard<std::mutex> lock(g_activeMutex);
     return g_active ? g_active->size() : 0;
 }
 
@@ -186,7 +187,7 @@ static bool playbackActiveOnce()
     // Get atomic snapshot of active buffer
     std::shared_ptr<std::vector<uint16_t>> local;
     {
-        std::lock_guard<std::mutex> lock(g_bufMutex);
+        std::lock_guard<std::mutex> lock(g_activeMutex);
         local = g_active;
     }
 
@@ -242,12 +243,11 @@ static bool playbackActiveOnce()
     const uint32_t framesRx = g_stats.frames_received.load(std::memory_order_relaxed);
     const uint32_t badCrc = g_stats.packets_bad_crc.load(std::memory_order_relaxed);
     char statsLine[80];
-    snprintf(statsLine, sizeof(statsLine), "FPS:%lu.%lu Vec:%lu Rx:%lu Err:%lu",
-             (unsigned long)(fps_x10 / 10u),
-             (unsigned long)(fps_x10 % 10u),
+    snprintf(statsLine, sizeof(statsLine), "Vec:%lu Rx:%lu Err:%lu FPS:%lu",
              (unsigned long)vecPerFrame,
              (unsigned long)framesRx,
-             (unsigned long)badCrc);
+             (unsigned long)badCrc,
+             (unsigned long)((fps_x10 + 5) / 10u));
     g_hp.DrawTextAtSized(20, 1950, statsLine, 1, 0);
 
     g_stats.frames_rendered.fetch_add(1, std::memory_order_relaxed);
@@ -300,18 +300,32 @@ static void swapStagingToActive()
     // DEBUG: If swap disabled, don't actually swap (to test if swapping causes flicker)
     if (!g_swapEnabled.load(std::memory_order_relaxed))
         return;
-        
-    std::lock_guard<std::mutex> lock(g_bufMutex);
-    g_active = std::make_shared<std::vector<uint16_t>>(g_staging);
+    
+    // Copy staging to new shared_ptr (hold staging mutex briefly)
+    std::shared_ptr<std::vector<uint16_t>> newActive;
+    {
+        std::lock_guard<std::mutex> lock(g_stagingMutex);
+        newActive = std::make_shared<std::vector<uint16_t>>(g_staging);
+    }
+    // Swap active pointer (hold active mutex very briefly)
+    {
+        std::lock_guard<std::mutex> lock(g_activeMutex);
+        g_active = newActive;
+    }
 }
 
 static void clearBuffers(bool clearActive, bool clearStaging)
 {
-    std::lock_guard<std::mutex> lock(g_bufMutex);
     if (clearActive)
+    {
+        std::lock_guard<std::mutex> lock(g_activeMutex);
         g_active.reset();
+    }
     if (clearStaging)
+    {
+        std::lock_guard<std::mutex> lock(g_stagingMutex);
         g_staging.clear();
+    }
 }
 
 // ------------------------------------------------------------
@@ -535,7 +549,7 @@ private:
         }
 
         {
-            std::lock_guard<std::mutex> lock(g_bufMutex);
+            std::lock_guard<std::mutex> lock(g_stagingMutex);
             if (replace)
             {
                 g_staging = std::move(words);  // Move, don't copy
@@ -636,7 +650,7 @@ static void ScreenTask(void *param)
         g_screen.DrawLines(g_modeLine, g_fpsLine, g_vecLine);
         g_screen.Render();
 
-        vTaskDelay(pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
 
@@ -724,8 +738,11 @@ static void handleConsoleLine(const char *line)
         uint16_t hz = g_loopHz.load(std::memory_order_relaxed);
         size_t stagingSize = 0, activeSize = 0;
         {
-            std::lock_guard<std::mutex> lock(g_bufMutex);
+            std::lock_guard<std::mutex> lock(g_stagingMutex);
             stagingSize = g_staging.size();
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_activeMutex);
             activeSize = g_active ? g_active->size() : 0;
         }
         consolePrintf("mode=%s  loop=%s hz=%u  staging=%u words  active=%u words",
