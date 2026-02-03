@@ -159,8 +159,9 @@ def test_2(b: VectorBuilder, t: float) -> None:
     cy = MAXC // 2
     r = (MAXC // 2) - 40
     rays = 36
+    spin = t * 0.3  # Slow rotation
     for i in range(rays):
-        a = (2.0 * math.pi * i) / rays
+        a = (2.0 * math.pi * i) / rays + spin
         x = coord_from_norm(math.cos(a), cx, r)
         y = coord_from_norm(math.sin(a), cy, r)
         b.move_to(cx, cy)
@@ -316,7 +317,7 @@ def test_0(b: VectorBuilder, t: float) -> None:
     cy = MAXC * 0.5
     focal = MAXC * 1.2
     z_near, z_far = 0.2, 2.0
-    count = 100
+    count = 250
     margin = 50  # Buffer zone before recycling
     for _ in range(count):
         angle = random.random() * 2 * math.pi

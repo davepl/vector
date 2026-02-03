@@ -5,6 +5,7 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstring>
+#include <cmath>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -85,6 +86,18 @@ static std::atomic<uint16_t> g_loopHz{60};
 static std::atomic<uint32_t> g_lastLoopMs{0};
 static std::atomic<uint32_t> g_lastFrameUs{0};  // Microseconds for accurate FPS
 static std::atomic<UIMode> g_mode{UIMode::Binary};
+static std::atomic<uint32_t> g_lastRxMs{0};
+static std::atomic<uint32_t> g_lastIdleMs{0};
+static std::atomic<bool> g_idleActive{false};
+
+static uint16_t clampCoord(int v)
+{
+    if (v < 0)
+        return 0;
+    if (v > 2047)
+        return 2047;
+    return (uint16_t)v;
+}
 
 // Escape detection (pause +++ pause)
 static constexpr uint32_t kGuardMs = 500;
@@ -205,10 +218,9 @@ static bool playbackActiveOnce()
         }
     }
 
-    // Calculate vectors per frame and per second
+    // Calculate vectors per frame
     const uint32_t wordsPerFrame = local ? (uint32_t)local->size() : 0;
     const uint32_t vecPerFrame = wordsPerFrame / 4u;
-    const uint64_t totalVec = g_totalVectorsDrawn.load(std::memory_order_relaxed);
 
     // Draw the frame data if any
     if (local && !local->empty())
@@ -230,6 +242,7 @@ static bool playbackActiveOnce()
         }
         g_totalVectorsDrawn.fetch_add(vecPerFrame, std::memory_order_relaxed);
     }
+    const uint64_t totalVec = g_totalVectorsDrawn.load(std::memory_order_relaxed);
 
     // Reset intensity to max before drawing stats overlay
     g_hp.SendWord(0x63FFu);  // Intensity max (param 000, value 0x3FF)
@@ -241,18 +254,225 @@ static bool playbackActiveOnce()
     g_hp.SendWord(g_hp.MakeYWord(0, false));
 
     // Always draw stats overlay at top of screen
-    const uint32_t framesRx = g_stats.frames_received.load(std::memory_order_relaxed);
-    const uint32_t badCrc = g_stats.packets_bad_crc.load(std::memory_order_relaxed);
-    char statsLine[80];
-    snprintf(statsLine, sizeof(statsLine), "Vec:%lu Rx:%lu Err:%lu FPS:%lu",
-             (unsigned long)vecPerFrame,
-             (unsigned long)framesRx,
-             (unsigned long)badCrc,
-             (unsigned long)((fps_x10 + 5) / 10u));
-    g_hp.DrawTextAtSized(20, 1950, statsLine, 1, 0);
+    char line1[64];
+    char line2[64];
+    char line3[64];
+    snprintf(line1, sizeof(line1), "FPS/s: %lu.%lu",
+             (unsigned long)(fps_x10 / 10u),
+             (unsigned long)(fps_x10 % 10u));
+    snprintf(line2, sizeof(line2), "Vec/frame: %lu",
+             (unsigned long)vecPerFrame);
+    snprintf(line3, sizeof(line3), "Total: %llu",
+             (unsigned long long)totalVec);
+    g_hp.DrawTextAtSized(20, 1950, line1, 1, 0);
+    g_hp.DrawTextAtSized(20, 1880, line2, 1, 0);
+    g_hp.DrawTextAtSized(20, 1810, line3, 1, 0);
 
     g_stats.frames_rendered.fetch_add(1, std::memory_order_relaxed);
     return true;
+}
+
+static uint16_t estimateTextWidth(uint8_t size, size_t len)
+{
+    const uint16_t base = 24;
+    const uint16_t scale = (uint16_t)(size + 1);
+    return (uint16_t)(len * base * scale);
+}
+
+static void drawIdleSplash()
+{
+    // Starfield background.
+    const float cx = 1024.0f;
+    const float cy = 1024.0f;
+    const float focal = 1400.0f;
+    const float zNear = 0.2f;
+    const float zFar = 2.2f;
+    const int count = 120;
+
+    const float t = millis() * 0.001f;
+    const float zSpan = zFar - zNear;
+    const float speed = 0.5f;
+
+    auto rand01 = [](uint32_t &seed) -> float {
+        seed = seed * 1664525u + 1013904223u;
+        return (seed >> 8) * (1.0f / 16777216.0f);
+    };
+
+    // Line clipping function (Liang-Barsky algorithm)
+    auto clipLine = [](float &x0, float &y0, float &x1, float &y1,
+                       float xmin, float xmax, float ymin, float ymax) -> bool {
+        float t0 = 0.0f, t1 = 1.0f;
+        float dx = x1 - x0;
+        float dy = y1 - y0;
+        
+        auto clipTest = [&](float p, float q) -> bool {
+            if (p == 0.0f) return q >= 0.0f;
+            float r = q / p;
+            if (p < 0.0f) {
+                if (r > t1) return false;
+                if (r > t0) t0 = r;
+            } else {
+                if (r < t0) return false;
+                if (r < t1) t1 = r;
+            }
+            return true;
+        };
+        
+        if (!clipTest(-dx, x0 - xmin)) return false;  // Left
+        if (!clipTest(dx, xmax - x0)) return false;   // Right
+        if (!clipTest(-dy, y0 - ymin)) return false;  // Bottom
+        if (!clipTest(dy, ymax - y0)) return false;   // Top
+        
+        if (t1 < 1.0f) {
+            x1 = x0 + t1 * dx;
+            y1 = y0 + t1 * dy;
+        }
+        if (t0 > 0.0f) {
+            x0 = x0 + t0 * dx;
+            y0 = y0 + t0 * dy;
+        }
+        return true;
+    };
+
+    // Initialize star passcount values (90% get 1, 10% get 4 for brightness variation)
+    static std::vector<int> starPasscounts;
+    static bool passcountsInitialized = false;
+    if (!passcountsInitialized)
+    {
+        passcountsInitialized = true;
+        uint32_t seed = 0x9876543u;
+        for (int i = 0; i < count; ++i)
+        {
+            seed = seed * 1664525u + 1013904223u;
+            float randVal = (seed >> 8) * (1.0f / 16777216.0f);
+            int passcount = (randVal < 0.1f) ? 4 : 1;  // 10% get passcount=4, rest get 1
+            starPasscounts.push_back(passcount);
+        }
+    }
+
+    for (int i = 0; i < count; ++i)
+    {
+        uint32_t seed = 0x12345678u ^ (uint32_t)(i * 747796405u);
+        const float angle = rand01(seed) * 6.2831853f;
+        const float radius = rand01(seed) * 0.35f;
+        const float x = cosf(angle) * radius;
+        const float y = sinf(angle) * radius;
+        const float zBase = rand01(seed) * zSpan;
+        float z = zBase - fmodf(t * speed, zSpan);
+        if (z < 0.0f)
+            z += zSpan;
+        z += zNear;
+        const float px = cx + (x * focal) / z;
+        const float py = cy + (y * focal) / z;
+        
+        // Calculate screen velocity-based trail: project where the star was a moment ago
+        const float zPrev = z + speed * 0.05f;  // Where it was 0.05s ago
+        const float pxPrev = cx + (x * focal) / zPrev;
+        const float pyPrev = cy + (y * focal) / zPrev;
+        
+        // Trail points from previous position (creating motion blur)
+        const float dx = px - pxPrev;
+        const float dy = py - pyPrev;
+        
+        // Scale trail intensity by proximity (cubic falloff for dramatic effect)
+        const float falloff = 1.0f - (z - zNear) / (zFar - zNear);
+        const float intensity = falloff * falloff * falloff;
+        
+        const float tx = px + dx * intensity * 3.0f;  // Amplify trail
+        const float ty = py + dy * intensity * 3.0f;
+        
+        // Clip line to screen bounds [0, 2047]
+        float x0 = px, y0 = py, x1 = tx, y1 = ty;
+        if (clipLine(x0, y0, x1, y1, 0.0f, 2047.0f, 0.0f, 2047.0f))
+        {
+            // Draw the line multiple times based on star's passcount for brightness variation
+            const int passcount = starPasscounts[i];
+            for (int pass = 0; pass < passcount; ++pass)
+            {
+                g_hp.MoveTo(clampCoord((int)x0), clampCoord((int)y0));
+                g_hp.LineTo(clampCoord((int)x1), clampCoord((int)y1));
+            }
+        }
+    }
+
+    // Static background stars (initialized once)
+    static std::vector<std::pair<uint16_t, uint16_t>> staticStars;
+    static std::vector<bool> staticStarsVisible;
+    static bool staticStarsInitialized = false;
+    static uint32_t lastTwinkleMs = 0;
+    
+    if (!staticStarsInitialized)
+    {
+        staticStarsInitialized = true;
+        uint32_t seed = 0xABCDEF01u;
+        auto rand01 = [](uint32_t &s) -> float {
+            s = s * 1664525u + 1013904223u;
+            return (s >> 8) * (1.0f / 16777216.0f);
+        };
+        for (int i = 0; i < 50; ++i)
+        {
+            uint16_t x = (uint16_t)(rand01(seed) * 2047.0f);
+            uint16_t y = (uint16_t)(rand01(seed) * 2047.0f);
+            staticStars.emplace_back(x, y);
+            staticStarsVisible.push_back(true);  // Start all visible
+        }
+        lastTwinkleMs = millis();
+    }
+    
+    // Update twinkle state every 200ms
+    const uint32_t nowMs = millis();
+    if (nowMs - lastTwinkleMs >= 200)
+    {
+        lastTwinkleMs = nowMs;
+        uint32_t seed = nowMs ^ 0xDEADBEEF;
+        for (size_t i = 0; i < staticStarsVisible.size(); ++i)
+        {
+            seed = seed * 1664525u + 1013904223u;
+            float randVal = (seed >> 8) * (1.0f / 16777216.0f);
+            staticStarsVisible[i] = (randVal > 0.3f);  // 70% chance to be visible
+        }
+    }
+    
+    // Draw static stars as small dots (only if visible)
+    for (size_t i = 0; i < staticStars.size(); ++i)
+    {
+        if (staticStarsVisible[i])
+        {
+            g_hp.MoveTo(staticStars[i].first, staticStars[i].second);
+            g_hp.LineTo(staticStars[i].first, staticStars[i].second);
+        }
+    }
+
+    // Title and subtitle text.
+    const char *title = "HP 1345a";
+    const char *subtitle1 = "ESP32 Bridge";
+    const char *subtitle2 = "(C)2026 Plummer's Software LLC";
+    const char *url = "http://github.com/davepl/vector";
+    const uint16_t titleY = 1536;  // 1/4 down from top in HP coords
+    const uint16_t subtitleY = 512; // 3/4 down from top
+
+    // Manual tweaks to centering because the estimate isn't very accurate!
+
+    const uint16_t titleW = estimateTextWidth(3, strlen(title)) - 100;
+    const uint16_t subtitle1W = estimateTextWidth(3, strlen(subtitle1)) - 150;
+    const uint16_t subtitle2W = estimateTextWidth(1, strlen(subtitle2)) + 100;
+    const uint16_t urlW = estimateTextWidth(0, strlen(url)) + 250;
+
+    const uint16_t titleX     = (2047u > titleW) ? (uint16_t)((2047u - titleW) / 2u) : 0u;
+    const uint16_t subtitle1X = (2047u > subtitle1W) ? (uint16_t)((2047u - subtitle1W) / 2u): 0u;
+    const uint16_t subtitle2X = (2047u > subtitle2W) ? (uint16_t)((2047u - subtitle2W) / 2u): 0u;
+    const uint16_t urlX       = (2047u > urlW) ? (uint16_t)((2047u - urlW) / 2u): 0u;
+
+    // We overdraw some of these multiple times to make them brighter
+
+    g_hp.DrawTextAtSized(titleX, titleY, title, 3, 0);
+    g_hp.DrawTextAtSized(titleX, titleY, title, 3, 0);
+    g_hp.DrawTextAtSized(titleX, titleY, title, 3, 0);
+    g_hp.DrawTextAtSized(titleX, titleY, title, 3, 0);
+    g_hp.DrawTextAtSized(subtitle1X, subtitleY, subtitle1, 3, 0);
+    g_hp.DrawTextAtSized(subtitle1X, subtitleY, subtitle1, 3, 0);
+    g_hp.DrawTextAtSized(subtitle2X, subtitleY - 120, subtitle2, 1, 0);
+    g_hp.DrawTextAtSized(urlX, subtitleY - 220, url, 0, 0);
 }
 
 // ------------------------------------------------------------
@@ -263,6 +483,22 @@ static void LoopTask(void *param)
     (void)param;
     while (true)
     {
+        const uint32_t nowMs = millis();
+        const uint32_t lastRx = g_lastRxMs.load(std::memory_order_relaxed);
+        const bool idleTimeout = (lastRx == 0) || ((nowMs - lastRx) > 1000u);
+        if (idleTimeout)
+        {
+            g_idleActive.store(true, std::memory_order_relaxed);
+        }
+        if (g_idleActive.load(std::memory_order_relaxed) &&
+            !g_loopEnabled.load(std::memory_order_relaxed))
+        {
+            g_lastIdleMs.store(nowMs, std::memory_order_relaxed);
+            drawIdleSplash();
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
+
         if (!g_loopEnabled.load(std::memory_order_relaxed))
         {
             // Even when not looping, draw stats overlay periodically
@@ -315,6 +551,7 @@ static void swapStagingToActive()
         std::lock_guard<std::mutex> lock(g_activeMutex);
         g_active = newActive;
     }
+    g_idleActive.store(false, std::memory_order_relaxed);
 }
 
 static void clearBuffers(bool clearActive, bool clearStaging)
@@ -532,6 +769,7 @@ private:
             break;
         }
 
+        g_lastRxMs.store(millis(), std::memory_order_relaxed);
         g_stats.packets_ok.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -666,11 +904,13 @@ static void pollConsoleInput();
 static void SerialTask(void *param)
 {
     (void)param;
+    uint32_t lastOkPackets = g_stats.packets_ok.load(std::memory_order_relaxed);
     
     while (true)
     {
         const UIMode mode = g_mode.load(std::memory_order_relaxed);
         const uint32_t now = millis();
+        bool sawPacket = false;
 
         if (mode == UIMode::Binary)
         {
@@ -687,6 +927,13 @@ static void SerialTask(void *param)
                     feedEscapeDetector(b, tnow);
                     g_parser.ProcessByte(b);
                     avail--;
+                    const uint32_t okNow =
+                        g_stats.packets_ok.load(std::memory_order_relaxed);
+                    if (okNow != lastOkPackets)
+                    {
+                        sawPacket = true;
+                        lastOkPackets = okNow;
+                    }
                 }
                 // Yield after processing batch to let IDLE0 feed watchdog
                 // At 921600 baud (~92 bytes/ms) with 8KB buffer, 1ms delay is safe
@@ -706,6 +953,11 @@ static void SerialTask(void *param)
         {
             pollConsoleInput();
             //vTaskDelay(1);
+        }
+
+        if (sawPacket)
+        {
+            g_lastRxMs.store(now, std::memory_order_relaxed);
         }
     }
 }
