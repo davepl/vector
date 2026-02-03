@@ -118,6 +118,26 @@ void Screen::DrawStatus(bool connected)
     g_display.print(text);
 }
 
+// Draw up to three lines of text inside the bordered area.
+void Screen::DrawLines(const char* line1, const char* line2, const char* line3)
+{
+    const uint8_t textSize = 1;
+    const uint8_t charWidth = 6 * textSize;
+    const uint8_t charHeight = 8 * textSize;
+    const int16_t left = 2;
+    const int16_t top = 2;
+
+    std::lock_guard<std::mutex> lock(g_displayMutex);
+    g_display.setTextSize(textSize);
+    g_display.setTextColor(SSD1306_WHITE);
+    g_display.setCursor(left, top);
+    if (line1) g_display.print(line1);
+    g_display.setCursor(left, top + charHeight + 2);
+    if (line2) g_display.print(line2);
+    g_display.setCursor(left, top + (charHeight + 2) * 2);
+    if (line3) g_display.print(line3);
+}
+
 // Flush the framebuffer to the OLED.
 void Screen::Render()
 {

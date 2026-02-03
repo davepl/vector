@@ -44,6 +44,8 @@ public:
     bool PenInvert() const;
     void SetRfdActiveLow(bool activeLow);
     bool RfdActiveLow() const;
+    void SetQuiet(bool quiet);
+    bool Quiet() const;
 
     // Status queries.
     bool IsConnected() const;
@@ -75,9 +77,13 @@ public:
     void DrawTextAtSized(uint16_t x, uint16_t y, const char* text, uint8_t size, uint8_t rot);
     void DrawTextAt(uint16_t x, uint16_t y, const char* text);
 
+    // Vector counting (for FPS/stats display).
+    uint32_t VectorCount() const;
+    void ResetVectorCount();
+    void AddVectorCount(uint32_t count);
+
     // Wiring diagnostics.
     void PulseDavLowMs(uint32_t holdMs);
-    void ToggleD11ForWiringCheck(Stream& out);
 
 private:
     bool RfdAsserted() const;
@@ -94,6 +100,7 @@ private:
     std::atomic<bool> penInvert_{false};
     std::atomic<bool> verbose_{false};
     std::atomic<bool> traceHandshake_{false};
+    std::atomic<bool> quiet_{false};
     bool rfdActiveLow_{true};
 
     uint32_t okCount_ = 0;
@@ -104,4 +111,5 @@ private:
 
     uint16_t curX_ = 0;
     uint16_t curY_ = 0;
+    uint32_t vectorCount_ = 0;
 };

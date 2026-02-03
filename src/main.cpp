@@ -1,946 +1,1257 @@
-#include <Arduino.h>
-#include <algorithm>
-#include <atomic>
-#include <chrono>
-#include <math.h>
-#include <stdio.h>
-#include <thread>
-#include <vector>
 #include "hp_vector_device.h"
+#include <Arduino.h>
+#include <atomic>
+#include <cctype>
+#include <cstdarg>
+#include <cstdint>
+#include <cstring>
+#include <cmath>
+#include <memory>
+#include <mutex>
+#include <vector>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_task_wdt.h"
 #include "screen.h"
 
-// -------------------------
-// ESP32-S3 -> HP1345A Wiring
-// -------------------------
-// HP 1345A rear connector signals used in immediate mode:
-//   - Data: D0..D14
-//   - DAV (host output, active low)
-//   - RFD (display output, active low)
-//
-// IMPORTANT: Protect ESP32 input pins (RFD, XACK) from 5V.
-// Use a resistor divider (e.g., 10k series from HP->GPIO, 20k GPIO->GND).
-//
-// Also: HP pin 7 (DISCONNECT SENSE) must be tied to GND on your cable harness.
-
-// -------------------------
+// ------------------------------------------------------------
 // Pin assignment (Heltec WiFi Kit 32 V3 / WiFi LoRa 32 V3)
-//
-// Notes:
-// - Avoid OLED pins: GPIO17 (SDA), GPIO18 (SCL), GPIO21 (RST)
-// - Avoid Vext Ctrl: GPIO36
-// - Avoid flash/PSRAM pins: GPIO33-38, GPIO26
-// - Avoid CP2102 UART pins: GPIO43/44
-// - GPIO0/3/45/46 are strapping pins; used here ONLY as outputs.
-//
-// Data bus: 15 pins
-// D0..D14 -> {8,2,3,4,5,6,7,39,40,41,42,45,46,47,48}
-//
-// Control pins:
-// DAV/WR -> GPIO20 (OUT)  (Immediate mode uses DAV)
-// RFD    -> GPIO19 (IN)   (Immediate mode reads RFD)
-// DS     -> GPIO37 (OUT)  (704 mode later)
-// RD     -> GPIO38 (OUT)  (704 mode later)
-// XACK   -> GPIO39 (IN)   (704 mode later)
-// -------------------------
-
-static const HPVectorDevice::Pins kHpPins = {
-    20,  // dav
-    19,  // rfd
-    -1,  // ds
-    -1,  // rd
-    -1,  // xack
+// ------------------------------------------------------------
+static const HPVectorDevice::Pins kHpPins = 
+{
+    20, // dav
+    19, // rfd
+    -1, // ds (unused for immediate mode)
+    -1, // rd (unused)
+    -1, // xack (unused)
     {1, 2, 3, 4, 5, 6, 7, 39, 40, 41, 42, 37, 33, 47, 48}
 };
 
 static HPVectorDevice g_hp(kHpPins);
 
-// HP1345A word format details live in HPVectorDevice for easier reuse.
-
-// Forward declarations for helpers that wrap the device.
-static void hpMoveTo(uint16_t x, uint16_t y);
-static void hpLineTo(uint16_t x, uint16_t y);
-
-static std::thread g_screenThread;
-static std::atomic<bool> g_echoRx{false};
-static std::atomic<uint8_t> g_testIndex{0};
-static std::atomic<bool> g_starfieldReset{true};
-static uint32_t g_fpsFrames = 0;
-static uint32_t g_fpsLastMs = 0;
-static uint32_t g_frameVectorCount = 0;
-static uint32_t g_lastVectorCount = 0;
-static char g_statsText[24] = "FPS:0 V:0";
-
-// Print the serial command help menu.
-static void printHelp()
+// ------------------------------------------------------------
+// Protocol / mode state
+// ------------------------------------------------------------
+enum class UIMode
 {
-    Serial.println("Commands:");
-    Serial.println("  h  help");
-    Serial.println("  s  status");
-    Serial.println("  d  pulse DAV low (wiring check)");
-    Serial.println("  w  toggle D11 (pen bit) for wiring check");
-    Serial.println("  p  toggle pen up/down sense");
-    Serial.println("  t  toggle transfers on/off");
-    Serial.println("  v  toggle verbose logging");
-    Serial.println("  b  toggle handshake trace (per-word)");
-    Serial.println("  x  toggle RX echo");
-    Serial.println("  0..9  select test pattern");
-    Serial.println("  n  next test pattern");
+    Binary,
+    Console
+};
+
+struct Stats
+{
+    std::atomic<uint32_t> packets_ok{0};
+    std::atomic<uint32_t> packets_bad_crc{0};
+    std::atomic<uint32_t> parse_resyncs{0};
+    std::atomic<uint32_t> playback_timeouts{0};
+    std::atomic<uint32_t> words_received{0};
+    std::atomic<uint32_t> frames_rendered{0};
+    std::atomic<uint32_t> frames_received{0};  // New frames swapped in
+};
+
+static Stats g_stats;
+
+// Double-buffered frame data using shared_ptr for atomic swap.
+// Staging buffer accumulates incoming words until commit.
+// Active buffer is what the drawing task renders (atomically swapped).
+static std::vector<uint16_t> g_staging;
+static std::shared_ptr<std::vector<uint16_t>> g_active;
+static std::mutex g_stagingMutex;  // Protects g_staging only
+static std::mutex g_activeMutex;   // Protects g_active only (very brief holds)
+
+// FreeRTOS task handles
+static TaskHandle_t g_screenTask = nullptr;
+static TaskHandle_t g_loopTask = nullptr;
+static TaskHandle_t g_serialTask = nullptr;
+
+// OLED status data
+static char g_modeLine[32] = "";
+static char g_fpsLine[32] = "";
+static char g_vecLine[32] = "";
+static uint32_t g_screenLastFrames = 0;
+static uint32_t g_screenLastMs = 0;
+
+// Total vectors drawn (for stats overlay)
+static std::atomic<uint64_t> g_totalVectorsDrawn{0};
+
+static size_t activeWordCount()
+{
+    std::lock_guard<std::mutex> lock(g_activeMutex);
+    return g_active ? g_active->size() : 0;
 }
 
+static std::atomic<bool> g_loopEnabled{false};
+static std::atomic<bool> g_swapEnabled{true};  // DEBUG: 'd' key toggles this
+static std::atomic<uint16_t> g_loopHz{60};
+static std::atomic<uint32_t> g_lastLoopMs{0};
+static std::atomic<uint32_t> g_lastFrameUs{0};  // Microseconds for accurate FPS
+static std::atomic<UIMode> g_mode{UIMode::Binary};
+static std::atomic<uint32_t> g_lastRxMs{0};
+static std::atomic<uint32_t> g_lastIdleMs{0};
+static std::atomic<bool> g_idleActive{false};
 
-// Report the current input pin states.
-static void reportInputs()
+static uint16_t clampCoord(int v)
 {
-    g_hp.ReportInputs(Serial);
+    if (v < 0)
+        return 0;
+    if (v > 2047)
+        return 2047;
+    return (uint16_t)v;
 }
 
-// Print a compact bus status line to Serial.
-static void printBusStatus()
+// Escape detection (pause +++ pause)
+static constexpr uint32_t kGuardMs = 500;
+static uint32_t g_lastByteMs = 0;
+static bool g_guardPrimed = false;
+static uint8_t g_plusRun = 0;
+static bool g_waitingGuard2 = false;
+static uint32_t g_guard2StartMs = 0;
+
+// ------------------------------------------------------------
+// CRC16-CCITT (poly 0x1021, init 0xFFFF)
+// ------------------------------------------------------------
+static uint16_t crc16_ccitt(const uint8_t *data, size_t len)
 {
-    g_hp.PrintBusStatus(Serial, g_testIndex.load(std::memory_order_relaxed));
-}
-
-// Pulse DAV low for a wiring check.
-static void pulseDavLowMs(uint32_t holdMs)
-{
-    g_hp.PulseDavLowMs(holdMs);
-}
-
-// Toggle the D11 data bit to verify wiring.
-static void toggleD11ForWiringCheck()
-{
-    g_hp.ToggleD11ForWiringCheck(Serial);
-}
-
-// Handle incoming serial commands; optionally skip destructive actions.
-static void serviceSerialCommands(bool allowDestructive = true)
-{
-    // Keep command handling lightweight so we can call it from tight loops.
-    // If allowDestructive is false, we only honor safe toggles.
-    while (Serial.available() > 0) {
-        const int c = Serial.read();
-        if (c == '\r' || c == '\n') continue;
-
-        if (g_echoRx.load(std::memory_order_relaxed)) {
-            Serial.printf("[RX '%c' 0x%02X]\n", (c >= 32 && c <= 126) ? (char)c : '?', (unsigned)c);
-        }
-
-        if (c == 'h' || c == 'H' || c == '?') {
-            printHelp();
-            continue;
-        }
-        if (c == 's' || c == 'S') {
-            printBusStatus();
-        } else if (c == 'v' || c == 'V') {
-            const bool nv = !g_hp.Verbose();
-            g_hp.SetVerbose(nv);
-            Serial.printf("Verbose %s\n", nv ? "ON" : "OFF");
-        } else if (c == 'b' || c == 'B') {
-            const bool nv = !g_hp.TraceHandshake();
-            g_hp.SetTraceHandshake(nv);
-            Serial.printf("Handshake trace %s\n", nv ? "ON" : "OFF");
-        } else if (c == 'x' || c == 'X') {
-            const bool nv = !g_echoRx.load(std::memory_order_relaxed);
-            g_echoRx.store(nv, std::memory_order_relaxed);
-            Serial.printf("RX echo %s\n", nv ? "ON" : "OFF");
-        } else if (c == 'n' || c == 'N') {
-            const uint8_t next = (uint8_t)((g_testIndex.load(std::memory_order_relaxed) + 1) % 10);
-            g_testIndex.store(next, std::memory_order_relaxed);
-            Serial.printf("Test pattern = %u\n", (unsigned)next);
-        } else if (c >= '0' && c <= '9') {
-            const uint8_t idx = (uint8_t)(c - '0');
-            g_testIndex.store(idx, std::memory_order_relaxed);
-            Serial.printf("Test pattern = %u\n", (unsigned)idx);
-        } else if (c == 'p' || c == 'P') {
-            const bool nv = !g_hp.PenInvert();
-            g_hp.SetPenInvert(nv);
-            Serial.printf("Pen sense: %s (bit11=1 means %s)\n",
-                          nv ? "INVERTED" : "NORMAL",
-                          nv ? "pen UP" : "pen DOWN");
-        } else if (c == 't' || c == 'T') {
-            const bool newVal = !g_hp.TransfersEnabled();
-            g_hp.SetTransfersEnabled(newVal);
-            Serial.printf("Transfers %s\n", newVal ? "ENABLED" : "PAUSED");
-        } else if (!allowDestructive) {
-            // Ignore everything else while inside handshake waits.
-        } else if (c == 'd' || c == 'D') {
-            Serial.println("Pulsing DAV low for 500ms...");
-            pulseDavLowMs(500);
-            printBusStatus();
-        } else if (c == 'w' || c == 'W') {
-            toggleD11ForWiringCheck();
-        } else {
-            Serial.printf("Unknown command '%c' (0x%02X). Send 'h' for help.\n", (char)c, (unsigned)c);
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < len; ++i)
+    {
+        crc ^= (uint16_t)data[i] << 8;
+        for (int b = 0; b < 8; ++b)
+        {
+            crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021)
+                                 : (uint16_t)(crc << 1);
         }
     }
+    return crc;
 }
 
-// Service callback used by the HPVectorDevice while waiting on handshake lines.
-static void serviceCommandsForWait()
+// ------------------------------------------------------------
+// Escape sequence detector
+// ------------------------------------------------------------
+static void resetEscapeDetector()
 {
-    serviceSerialCommands(false);
+    g_guardPrimed = false;
+    g_plusRun = 0;
+    g_waitingGuard2 = false;
+    g_guard2StartMs = 0;
+    g_lastByteMs = millis();
 }
 
-// Move the beam without drawing (wrapper for vector count parity).
-static void hpMoveTo(uint16_t x, uint16_t y)
+static void feedEscapeDetector(uint8_t byte, uint32_t nowMs)
 {
-    g_hp.MoveTo(x, y);
-}
+    const uint32_t delta = nowMs - g_lastByteMs;
 
-// Draw a line and increment the per-frame vector count.
-static void hpLineTo(uint16_t x, uint16_t y)
-{
-    g_hp.LineTo(x, y);
-    g_frameVectorCount++;
-}
-
-// Draw text with explicit size/rotation through the device.
-static void drawTextAtSized(uint16_t x, uint16_t y, const char *text, uint8_t size, uint8_t rot)
-{
-    g_hp.DrawTextAtSized(x, y, text, size, rot);
-}
-
-// Draw 1X text through the device.
-static void drawTextAt(uint16_t x, uint16_t y, const char *text)
-{
-    g_hp.DrawTextAt(x, y, text);
-}
-
-// Periodically refresh the OLED status strip.
-static void ScreenThread()
-{
-    while (true) {
-        const bool connected = g_hp.IsConnected();
-        g_screen.Clear();
-        g_screen.DrawBorder();
-        g_screen.DrawStatus(connected);
-        g_screen.Render();
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    if (g_waitingGuard2)
+    {
+        g_waitingGuard2 = false;
+        g_guardPrimed = false;
+        g_plusRun = 0;
     }
-}
 
-// Convert a normalized coordinate to device space.
-static inline uint16_t coordMax() { return g_hp.CoordMax(); }
-static inline uint16_t clampCoord(int32_t v) { return g_hp.ClampCoord(v); }
-static inline uint16_t coordFromNorm(float n, uint16_t center, uint16_t radius)
-{
-    return g_hp.CoordFromNorm(n, center, radius);
-}
-
-// Update the on-screen FPS/vector count text once per second.
-static void updateFpsText()
-{
-    const uint32_t now = millis();
-    g_fpsFrames++;
-    if (g_fpsLastMs == 0) {
-        g_fpsLastMs = now;
-        return;
+    if (delta >= kGuardMs)
+    {
+        g_guardPrimed = true;
+        g_plusRun = 0;
     }
-    const uint32_t dt = now - g_fpsLastMs;
-    if (dt >= 1000) {
-        const float fps = (g_fpsFrames * 1000.0f) / (float)dt;
-        const unsigned fpsInt = (unsigned)lroundf(fps);
-        snprintf(g_statsText, sizeof(g_statsText), "FPS:%u V:%lu", fpsInt, (unsigned long)g_lastVectorCount);
-        g_fpsFrames = 0;
-        g_fpsLastMs = now;
-    }
-}
 
-// HP display init now lives inside HPVectorDevice.
-
-// TestCase0: square with diagonals.
-static void TestCase0()
-{
-    // Square with an X
-    const uint16_t maxc = coordMax();
-    const uint16_t m = 80;
-    const uint16_t minv = m;
-    const uint16_t maxv = maxc - m;
-
-    hpMoveTo(minv, minv);
-    hpLineTo(maxv, minv);
-    hpLineTo(maxv, maxv);
-    hpLineTo(minv, maxv);
-    hpLineTo(minv, minv);
-
-    hpMoveTo(minv, minv);
-    hpLineTo(maxv, maxv);
-    hpMoveTo(minv, maxv);
-    hpLineTo(maxv, minv);
-}
-
-// TestCase1: concentric squares.
-static void TestCase1()
-{
-    // Concentric squares
-    const uint16_t maxc = coordMax();
-    const uint16_t steps = 6;
-    const uint16_t margin = 60;
-    const uint16_t span = maxc - (margin * 2);
-    const uint16_t step = span / (steps * 2);
-
-    for (uint16_t i = 0; i < steps; ++i) {
-        const uint16_t minv = margin + (i * step);
-        const uint16_t maxv = maxc - margin - (i * step);
-        hpMoveTo(minv, minv);
-        hpLineTo(maxv, minv);
-        hpLineTo(maxv, maxv);
-        hpLineTo(minv, maxv);
-        hpLineTo(minv, minv);
-    }
-}
-
-// TestCase2: radial starburst.
-static void TestCase2()
-{
-    // Starburst
-    const uint16_t maxc = coordMax();
-    const uint16_t cx = maxc / 2;
-    const uint16_t cy = maxc / 2;
-    const uint16_t r = (maxc / 2) - 40;
-    const uint16_t rays = 36;
-    const float twoPi = 6.283185307f;
-
-    for (uint16_t i = 0; i < rays; ++i) {
-        const float a = twoPi * ((float)i / (float)rays);
-        const uint16_t x = coordFromNorm(cosf(a), cx, r);
-        const uint16_t y = coordFromNorm(sinf(a), cy, r);
-        hpMoveTo(cx, cy);
-        hpLineTo(x, y);
-    }
-}
-
-// TestCase3: rectangular spiral.
-static void TestCase3()
-{
-    // Rectangular spiral
-    const uint16_t maxc = coordMax();
-    uint16_t left = 60;
-    uint16_t right = maxc - 60;
-    uint16_t top = 60;
-    uint16_t bottom = maxc - 60;
-    const uint16_t step = 35;
-
-    hpMoveTo(left, top);
-    while (left + step < right && top + step < bottom) {
-        hpLineTo(right, top);
-        hpLineTo(right, bottom);
-        hpLineTo(left, bottom);
-        left += step;
-        top += step;
-        right -= step;
-        bottom -= step;
-        hpLineTo(left, top);
-    }
-}
-
-// TestCase4: grid of spinning 3D cubes.
-static void TestCase4()
-{
-    // Grid of spinning 3D cubes.
-    const uint16_t maxc = coordMax();
-    const float cx = (float)maxc * 0.5f;
-    const float cy = (float)maxc * 0.5f;
-
-    const int cols = 4;
-    const int rows = 3;
-    const int cubeCount = cols * rows; // 12 cubes -> 144 edges (vectors)
-
-    const float gridW = (float)maxc * 0.675f;
-    const float gridH = (float)maxc * 0.675f;
-    const float startX = cx - gridW * 0.5f;
-    const float startY = cy - gridH * 0.5f;
-    const float stepX = gridW / (float)(cols - 1);
-    const float stepY = gridH / (float)(rows - 1);
-
-    const float cubeSize = (float)maxc * 0.150f;
-    const float focal = (float)maxc * 1.2f;
-    const float zBase = (float)maxc * 2.4f;
-
-    struct Vec3 { float x; float y; float z; };
-    static const Vec3 verts[8] = {
-        {-1, -1, -1},
-        { 1, -1, -1},
-        { 1,  1, -1},
-        {-1,  1, -1},
-        {-1, -1,  1},
-        { 1, -1,  1},
-        { 1,  1,  1},
-        {-1,  1,  1},
-    };
-    static const uint8_t edges[12][2] = {
-        {0,1},{1,2},{2,3},{3,0},
-        {4,5},{5,6},{6,7},{7,4},
-        {0,4},{1,5},{2,6},{3,7}
-    };
-
-    const float t = (float)millis() * 0.001f;
-    int idx = 0;
-    for (int r = 0; r < rows; ++r) {
-        for (int c = 0; c < cols; ++c, ++idx) {
-            const float ox = startX + (float)c * stepX;
-            const float oy = startY + (float)r * stepY;
-
-            const float phase = (float)idx * 0.35f;
-            const float ax = t * 1.8f + phase;
-            const float ay = t * 1.4f + phase * 0.7f;
-            const float az = t * 1.2f + phase * 0.4f;
-
-            const float cx1 = cosf(ax), sx1 = sinf(ax);
-            const float cy1 = cosf(ay), sy1 = sinf(ay);
-            const float cz1 = cosf(az), sz1 = sinf(az);
-
-            Vec3 proj[8];
-            for (int i = 0; i < 8; ++i) {
-                // Scale
-                float x = verts[i].x * cubeSize;
-                float y = verts[i].y * cubeSize;
-                float z = verts[i].z * cubeSize;
-
-                // Rotate X
-                float y1 = y * cx1 - z * sx1;
-                float z1 = y * sx1 + z * cx1;
-                y = y1; z = z1;
-
-                // Rotate Y
-                float x2 = x * cy1 + z * sy1;
-                float z2 = -x * sy1 + z * cy1;
-                x = x2; z = z2;
-
-                // Rotate Z
-                float x3 = x * cz1 - y * sz1;
-                float y3 = x * sz1 + y * cz1;
-                x = x3; y = y3;
-
-                // Perspective project
-                const float zf = zBase + z;
-                const float px = ox + (x * focal) / zf;
-                const float py = oy + (y * focal) / zf;
-                proj[i] = {px, py, zf};
+    if (g_guardPrimed)
+    {
+        if (byte == '+')
+        {
+            g_plusRun++;
+            if (g_plusRun == 3)
+            {
+                g_waitingGuard2 = true;
+                g_guard2StartMs = nowMs;
             }
+            else if (g_plusRun > 3)
+            {
+                g_guardPrimed = false;
+                g_plusRun = 0;
+                g_waitingGuard2 = false;
+            }
+        }
+        else
+        {
+            g_guardPrimed = false;
+            g_plusRun = 0;
+        }
+    }
 
-            for (int e = 0; e < 12; ++e) {
-                const Vec3 &a = proj[edges[e][0]];
-                const Vec3 &b = proj[edges[e][1]];
-                const uint16_t x0 = clampCoord((int32_t)lroundf(a.x));
-                const uint16_t y0 = clampCoord((int32_t)lroundf(a.y));
-                const uint16_t x1 = clampCoord((int32_t)lroundf(b.x));
-                const uint16_t y1 = clampCoord((int32_t)lroundf(b.y));
-                hpMoveTo(x0, y0);
-                hpLineTo(x1, y1);
+    g_lastByteMs = nowMs;
+}
+
+static bool escapeGuard2Satisfied(uint32_t nowMs)
+{
+    if (!g_waitingGuard2)
+        return false;
+    if ((nowMs - g_guard2StartMs) >= kGuardMs)
+    {
+        resetEscapeDetector();
+        return true;
+    }
+    return false;
+}
+
+// ------------------------------------------------------------
+// Playback helpers
+// ------------------------------------------------------------
+static bool playbackActiveOnce()
+{
+    // Get atomic snapshot of active buffer
+    std::shared_ptr<std::vector<uint16_t>> local;
+    {
+        std::lock_guard<std::mutex> lock(g_activeMutex);
+        local = g_active;
+    }
+
+    // Calculate FPS for stats overlay using microseconds for accuracy
+    const uint32_t nowUs = (uint32_t)esp_timer_get_time();
+    const uint32_t lastUs = g_lastFrameUs.exchange(nowUs);
+    uint32_t fps_x10 = 0;
+    if (lastUs > 0 && nowUs > lastUs)
+    {
+        const uint32_t deltaUs = nowUs - lastUs;
+        if (deltaUs > 0)
+        {
+            fps_x10 = 10000000u / deltaUs;  // 10M / deltaUs gives FPS * 10
+        }
+    }
+
+    // Calculate vectors per frame
+    const uint32_t wordsPerFrame = local ? (uint32_t)local->size() : 0;
+    const uint32_t vecPerFrame = wordsPerFrame / 4u;
+
+    // Draw the frame data if any
+    if (local && !local->empty())
+    {
+        size_t count = 0;
+        for (uint16_t w : *local)
+        {
+            if (!g_hp.SendWord(w))
+            {
+                g_stats.playback_timeouts.fetch_add(1, std::memory_order_relaxed);
+                g_loopEnabled.store(false, std::memory_order_relaxed);
+                return false;
+            }
+            // vTaskDelay lets IDLE task run to feed watchdog every 32 words
+            if (++count % 32 == 0)
+            {
+                //vTaskDelay(1);
+            }
+        }
+        g_totalVectorsDrawn.fetch_add(vecPerFrame, std::memory_order_relaxed);
+    }
+    const uint64_t totalVec = g_totalVectorsDrawn.load(std::memory_order_relaxed);
+
+    // Reset intensity to max before drawing stats overlay
+    g_hp.SendWord(0x63FFu);  // Intensity max (param 000, value 0x3FF)
+    g_hp.SendWord(0x6FFFu);  // Extra bits set (safety for undocumented behavior)
+    g_hp.SendWord(0x67FFu);  // Focus max (param 001)
+    g_hp.SendWord(0x7000u);  // Writing rate slow (solid lines)
+
+    g_hp.SendWord(g_hp.MakeXWord(0, false));
+    g_hp.SendWord(g_hp.MakeYWord(0, false));
+
+    // Always draw stats overlay at top of screen
+    char line1[64];
+    char line2[64];
+    char line3[64];
+    snprintf(line1, sizeof(line1), "FPS/s: %lu.%lu",
+             (unsigned long)(fps_x10 / 10u),
+             (unsigned long)(fps_x10 % 10u));
+    snprintf(line2, sizeof(line2), "Vec/frame: %lu",
+             (unsigned long)vecPerFrame);
+    snprintf(line3, sizeof(line3), "Total: %llu",
+             (unsigned long long)totalVec);
+    g_hp.DrawTextAtSized(20, 1950, line1, 1, 0);
+    g_hp.DrawTextAtSized(20, 1880, line2, 1, 0);
+    g_hp.DrawTextAtSized(20, 1810, line3, 1, 0);
+
+    g_stats.frames_rendered.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+static uint16_t estimateTextWidth(uint8_t size, size_t len)
+{
+    const uint16_t base = 24;
+    const uint16_t scale = (uint16_t)(size + 1);
+    return (uint16_t)(len * base * scale);
+}
+
+static void drawIdleSplash()
+{
+    // Starfield background.
+    const float cx = 1024.0f;
+    const float cy = 1024.0f;
+    const float focal = 1400.0f;
+    const float zNear = 0.2f;
+    const float zFar = 2.2f;
+    const int count = 120;
+
+    const float t = millis() * 0.001f;
+    const float zSpan = zFar - zNear;
+    const float speed = 0.5f;
+
+    auto rand01 = [](uint32_t &seed) -> float {
+        seed = seed * 1664525u + 1013904223u;
+        return (seed >> 8) * (1.0f / 16777216.0f);
+    };
+
+    // Line clipping function (Liang-Barsky algorithm)
+    auto clipLine = [](float &x0, float &y0, float &x1, float &y1,
+                       float xmin, float xmax, float ymin, float ymax) -> bool {
+        float t0 = 0.0f, t1 = 1.0f;
+        float dx = x1 - x0;
+        float dy = y1 - y0;
+        
+        auto clipTest = [&](float p, float q) -> bool {
+            if (p == 0.0f) return q >= 0.0f;
+            float r = q / p;
+            if (p < 0.0f) {
+                if (r > t1) return false;
+                if (r > t0) t0 = r;
+            } else {
+                if (r < t0) return false;
+                if (r < t1) t1 = r;
+            }
+            return true;
+        };
+        
+        if (!clipTest(-dx, x0 - xmin)) return false;  // Left
+        if (!clipTest(dx, xmax - x0)) return false;   // Right
+        if (!clipTest(-dy, y0 - ymin)) return false;  // Bottom
+        if (!clipTest(dy, ymax - y0)) return false;   // Top
+        
+        if (t1 < 1.0f) {
+            x1 = x0 + t1 * dx;
+            y1 = y0 + t1 * dy;
+        }
+        if (t0 > 0.0f) {
+            x0 = x0 + t0 * dx;
+            y0 = y0 + t0 * dy;
+        }
+        return true;
+    };
+
+    // Initialize star passcount values (90% get 1, 10% get 4 for brightness variation)
+    static std::vector<int> starPasscounts;
+    static bool passcountsInitialized = false;
+    if (!passcountsInitialized)
+    {
+        passcountsInitialized = true;
+        uint32_t seed = 0x9876543u;
+        for (int i = 0; i < count; ++i)
+        {
+            seed = seed * 1664525u + 1013904223u;
+            float randVal = (seed >> 8) * (1.0f / 16777216.0f);
+            int passcount = (randVal < 0.1f) ? 4 : 1;  // 10% get passcount=4, rest get 1
+            starPasscounts.push_back(passcount);
+        }
+    }
+
+    for (int i = 0; i < count; ++i)
+    {
+        uint32_t seed = 0x12345678u ^ (uint32_t)(i * 747796405u);
+        const float angle = rand01(seed) * 6.2831853f;
+        const float radius = rand01(seed) * 0.35f;
+        const float x = cosf(angle) * radius;
+        const float y = sinf(angle) * radius;
+        const float zBase = rand01(seed) * zSpan;
+        float z = zBase - fmodf(t * speed, zSpan);
+        if (z < 0.0f)
+            z += zSpan;
+        z += zNear;
+        const float px = cx + (x * focal) / z;
+        const float py = cy + (y * focal) / z;
+        
+        // Calculate screen velocity-based trail: project where the star was a moment ago
+        const float zPrev = z + speed * 0.05f;  // Where it was 0.05s ago
+        const float pxPrev = cx + (x * focal) / zPrev;
+        const float pyPrev = cy + (y * focal) / zPrev;
+        
+        // Trail points from previous position (creating motion blur)
+        const float dx = px - pxPrev;
+        const float dy = py - pyPrev;
+        
+        // Scale trail intensity by proximity (cubic falloff for dramatic effect)
+        const float falloff = 1.0f - (z - zNear) / (zFar - zNear);
+        const float intensity = falloff * falloff * falloff;
+        
+        const float tx = px + dx * intensity * 3.0f;  // Amplify trail
+        const float ty = py + dy * intensity * 3.0f;
+        
+        // Clip line to screen bounds [0, 2047]
+        float x0 = px, y0 = py, x1 = tx, y1 = ty;
+        if (clipLine(x0, y0, x1, y1, 0.0f, 2047.0f, 0.0f, 2047.0f))
+        {
+            // Draw the line multiple times based on star's passcount for brightness variation
+            const int passcount = starPasscounts[i];
+            for (int pass = 0; pass < passcount; ++pass)
+            {
+                g_hp.MoveTo(clampCoord((int)x0), clampCoord((int)y0));
+                g_hp.LineTo(clampCoord((int)x1), clampCoord((int)y1));
             }
         }
     }
-}
 
-// TestCase5: ripple surface mesh.
-static void TestCase5()
-{
-    // Ripple surface (animated mesh)
-    const uint16_t maxc = coordMax();
-    const float width = (float)maxc;
-    const float height = (float)maxc;
-
-    const int GRID_RADIUS = 8;
-    const int GRID_STEP = 2;
-    const float BASE_TILT_X = 0.5993f; // ~55 deg
-    const float RIPPLE_FREQ = 0.65f;
-    const float RIPPLE_SPEED = 4.0f;
-    const float RIPPLE_DECAY = 0.015f;
-    const float HEIGHT_SCALE = 5.0f;
-    const float AMPLITUDE_FALLOFF = 0.06f;
-    const float VIEWER_DISTANCE = 20.0f;
-    const float ORTHO_SCALE =85.0f;
+    // Static background stars (initialized once)
+    static std::vector<std::pair<uint16_t, uint16_t>> staticStars;
+    static std::vector<bool> staticStarsVisible;
+    static bool staticStarsInitialized = false;
+    static uint32_t lastTwinkleMs = 0;
     
-    struct GridPoint { float x; float y; };
-    struct ProjPoint { float x; float y; float depth; bool valid; };
-    struct Quad { float depth; int i; int j; };
-    struct Segment { uint16_t x0; uint16_t y0; uint16_t x1; uint16_t y1; };
-    struct WordPair { uint16_t xWord; uint16_t yWord; };
-
-    static bool initialized = false;
-    static int gridSize = 0;
-    static std::vector<GridPoint> grid;
-    static std::vector<ProjPoint> proj;
-    static std::vector<Quad> quads;
-    static std::vector<Segment> segments;
-    static std::vector<WordPair> words;
-
-    if (!initialized) {
-        gridSize = (GRID_RADIUS * 2) / GRID_STEP + 1;
-        grid.resize(gridSize * gridSize);
-        proj.resize(gridSize * gridSize);
-        quads.reserve((gridSize - 1) * (gridSize - 1));
-
-        int idx = 0;
-        for (int xi = -GRID_RADIUS; xi <= GRID_RADIUS; xi += GRID_STEP) {
-            for (int yi = -GRID_RADIUS; yi <= GRID_RADIUS; yi += GRID_STEP) {
-                grid[idx++] = { (float)xi, (float)yi };
-            }
+    if (!staticStarsInitialized)
+    {
+        staticStarsInitialized = true;
+        uint32_t seed = 0xABCDEF01u;
+        auto rand01 = [](uint32_t &s) -> float {
+            s = s * 1664525u + 1013904223u;
+            return (s >> 8) * (1.0f / 16777216.0f);
+        };
+        for (int i = 0; i < 50; ++i)
+        {
+            uint16_t x = (uint16_t)(rand01(seed) * 2047.0f);
+            uint16_t y = (uint16_t)(rand01(seed) * 2047.0f);
+            staticStars.emplace_back(x, y);
+            staticStarsVisible.push_back(true);  // Start all visible
         }
-        initialized = true;
+        lastTwinkleMs = millis();
+    }
+    
+    // Update twinkle state every 200ms
+    const uint32_t nowMs = millis();
+    if (nowMs - lastTwinkleMs >= 200)
+    {
+        lastTwinkleMs = nowMs;
+        uint32_t seed = nowMs ^ 0xDEADBEEF;
+        for (size_t i = 0; i < staticStarsVisible.size(); ++i)
+        {
+            seed = seed * 1664525u + 1013904223u;
+            float randVal = (seed >> 8) * (1.0f / 16777216.0f);
+            staticStarsVisible[i] = (randVal > 0.3f);  // 70% chance to be visible
+        }
+    }
+    
+    // Draw static stars as small dots (only if visible)
+    for (size_t i = 0; i < staticStars.size(); ++i)
+    {
+        if (staticStarsVisible[i])
+        {
+            g_hp.MoveTo(staticStars[i].first, staticStars[i].second);
+            g_hp.LineTo(staticStars[i].first, staticStars[i].second);
+        }
     }
 
-    const float t = (float)millis() * 0.001f;
-    const float cosx = cosf(BASE_TILT_X);
-    const float sinx = sinf(BASE_TILT_X);
-    const float cosz = 1.0f;
-    const float sinz = 0.0f;
+    // Title and subtitle text.
+    const char *title = "HP 1345a";
+    const char *subtitle1 = "ESP32 Bridge";
+    const char *subtitle2 = "(C)2026 Plummer's Software LLC";
+    const char *url = "http://github.com/davepl/vector";
+    const uint16_t titleY = 1536;  // 1/4 down from top in HP coords
+    const uint16_t subtitleY = 512; // 3/4 down from top
 
-    auto rippleHeight = [&](float x, float y) -> float {
-        const float r = sqrtf(x * x + y * y);
-        const float wave = cosf(r * RIPPLE_FREQ - t * RIPPLE_SPEED);
-        const float envelope = expf(-r * RIPPLE_DECAY);
-        const float amplitude = HEIGHT_SCALE / (1.0f + AMPLITUDE_FALLOFF * r);
-        return wave * envelope * amplitude;
-    };
+    // Manual tweaks to centering because the estimate isn't very accurate!
 
-    // Project points
-    for (int i = 0; i < gridSize * gridSize; ++i) {
-        const float x = grid[i].x;
-        const float y = grid[i].y;
-        const float z = rippleHeight(x, y);
+    const uint16_t titleW = estimateTextWidth(3, strlen(title)) - 100;
+    const uint16_t subtitle1W = estimateTextWidth(3, strlen(subtitle1)) - 150;
+    const uint16_t subtitle2W = estimateTextWidth(1, strlen(subtitle2)) + 100;
+    const uint16_t urlW = estimateTextWidth(0, strlen(url)) + 250;
 
-        const float xSpin = x * cosz - y * sinz;
-        const float ySpin = x * sinz + y * cosz;
-        const float zSpin = z;
+    const uint16_t titleX     = (2047u > titleW) ? (uint16_t)((2047u - titleW) / 2u) : 0u;
+    const uint16_t subtitle1X = (2047u > subtitle1W) ? (uint16_t)((2047u - subtitle1W) / 2u): 0u;
+    const uint16_t subtitle2X = (2047u > subtitle2W) ? (uint16_t)((2047u - subtitle2W) / 2u): 0u;
+    const uint16_t urlX       = (2047u > urlW) ? (uint16_t)((2047u - urlW) / 2u): 0u;
 
-        const float yTilt = ySpin * cosx - zSpin * sinx;
-        const float zTilt = ySpin * sinx + zSpin * cosx;
-        const float depth = VIEWER_DISTANCE + zTilt;
-        if (depth <= 0.1f) {
-            proj[i] = {0, 0, 0, false};
+    // We overdraw some of these multiple times to make them brighter
+
+    g_hp.DrawTextAtSized(titleX, titleY, title, 3, 0);
+    g_hp.DrawTextAtSized(titleX, titleY, title, 3, 0);
+    g_hp.DrawTextAtSized(titleX, titleY, title, 3, 0);
+    g_hp.DrawTextAtSized(titleX, titleY, title, 3, 0);
+    g_hp.DrawTextAtSized(subtitle1X, subtitleY, subtitle1, 3, 0);
+    g_hp.DrawTextAtSized(subtitle1X, subtitleY, subtitle1, 3, 0);
+    g_hp.DrawTextAtSized(subtitle2X, subtitleY - 120, subtitle2, 1, 0);
+    g_hp.DrawTextAtSized(urlX, subtitleY - 220, url, 0, 0);
+}
+
+// ------------------------------------------------------------
+// Drawing task - runs on Core 0, continuously renders frames
+// ------------------------------------------------------------
+static void LoopTask(void *param)
+{
+    (void)param;
+    while (true)
+    {
+        const uint32_t nowMs = millis();
+        const uint32_t lastRx = g_lastRxMs.load(std::memory_order_relaxed);
+        const bool idleTimeout = (lastRx == 0) || ((nowMs - lastRx) > 1000u);
+        if (idleTimeout)
+        {
+            g_idleActive.store(true, std::memory_order_relaxed);
+        }
+        if (g_idleActive.load(std::memory_order_relaxed) &&
+            !g_loopEnabled.load(std::memory_order_relaxed))
+        {
+            g_lastIdleMs.store(nowMs, std::memory_order_relaxed);
+            drawIdleSplash();
+            vTaskDelay(pdMS_TO_TICKS(1));
             continue;
         }
-        const float px = xSpin * ORTHO_SCALE + (width / 2.0f);
-        const float py = -yTilt * ORTHO_SCALE + (height / 2.0f);
-        proj[i] = {px, py, depth, true};
-    }
 
-    // Build quads (painter's order, far to near)
-    quads.clear();
-    for (int i = 0; i < gridSize - 1; ++i) {
-        for (int j = 0; j < gridSize - 1; ++j) {
-            const int idx00 = i * gridSize + j;
-            const int idx10 = (i + 1) * gridSize + j;
-            const int idx11 = (i + 1) * gridSize + (j + 1);
-            const int idx01 = i * gridSize + (j + 1);
-            if (!proj[idx00].valid || !proj[idx10].valid || !proj[idx11].valid || !proj[idx01].valid) {
+        if (!g_loopEnabled.load(std::memory_order_relaxed))
+        {
+            // Even when not looping, draw stats overlay periodically
+            playbackActiveOnce();
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        const uint16_t hz = g_loopHz.load(std::memory_order_relaxed);
+        const uint32_t now = millis();
+        if (hz > 0)
+        {
+            const uint32_t interval = 1000u / hz;
+            const uint32_t last = g_lastLoopMs.load(std::memory_order_relaxed);
+            if (last != 0 && (now - last) < interval)
+            {
+                vTaskDelay(pdMS_TO_TICKS(1));
                 continue;
             }
-            const float avgDepth = (proj[idx00].depth + proj[idx10].depth + proj[idx11].depth + proj[idx01].depth) * 0.25f;
-            quads.push_back({avgDepth, i, j});
         }
+        g_lastLoopMs.store(now, std::memory_order_relaxed);
+        playbackActiveOnce();
+        // Always yield after frame to feed watchdog
+        vTaskDelay(1);
     }
-    std::sort(quads.begin(), quads.end(), [](const Quad &a, const Quad &b) { return a.depth > b.depth; });
-
-    segments.clear();
-    segments.reserve(quads.size() * 4);
-    for (const Quad &q : quads) {
-        const int i = q.i;
-        const int j = q.j;
-        const ProjPoint &p00 = proj[i * gridSize + j];
-        const ProjPoint &p10 = proj[(i + 1) * gridSize + j];
-        const ProjPoint &p11 = proj[(i + 1) * gridSize + (j + 1)];
-        const ProjPoint &p01 = proj[i * gridSize + (j + 1)];
-
-        auto toSeg = [&](const ProjPoint &a, const ProjPoint &b) {
-            const uint16_t x0 = clampCoord((int32_t)lroundf(a.x));
-            const uint16_t y0 = clampCoord((int32_t)lroundf(a.y));
-            const uint16_t x1 = clampCoord((int32_t)lroundf(b.x));
-            const uint16_t y1 = clampCoord((int32_t)lroundf(b.y));
-            segments.push_back({x0, y0, x1, y1});
-        };
-
-        toSeg(p00, p10);
-        toSeg(p10, p11);
-        toSeg(p11, p01);
-        toSeg(p01, p00);
-    }
-
-    words.clear();
-    words.reserve(segments.size() * 2);
-    for (const Segment &s : segments) {
-        words.push_back({g_hp.MakeXWord(s.x0, false), g_hp.MakeYWord(s.y0, false)});
-        words.push_back({g_hp.MakeXWord(s.x1, true), g_hp.MakeYWord(s.y1, true)});
-    }
-
-    for (const WordPair &p : words) {
-        g_hp.SendWord(p.xWord);
-        g_hp.SendWord(p.yWord);
-    }
-    g_frameVectorCount += (uint32_t)segments.size();
 }
 
-// TestCase6: 3D starfield streaks.
-static void TestCase6()
+// ------------------------------------------------------------
+// Buffer control helpers
+// ------------------------------------------------------------
+static void swapStagingToActive()
 {
-    // 3D starfield (N=200)
-    struct Star {
-        float x;
-        float y;
-        float z;
+    // Always count received frames for Rx stat
+    g_stats.frames_received.fetch_add(1, std::memory_order_relaxed);
+    
+    // DEBUG: If swap disabled, don't actually swap (to test if swapping causes flicker)
+    if (!g_swapEnabled.load(std::memory_order_relaxed))
+        return;
+    
+    // Move staging to new active (no copy - just pointer transfer)
+    std::shared_ptr<std::vector<uint16_t>> newActive;
+    {
+        std::lock_guard<std::mutex> lock(g_stagingMutex);
+        // Move the staging vector contents to new shared_ptr (no data copy)
+        newActive = std::make_shared<std::vector<uint16_t>>(std::move(g_staging));
+        g_staging.clear();  // Reset staging for next frame
+    }
+    // Swap active pointer (hold active mutex very briefly)
+    {
+        std::lock_guard<std::mutex> lock(g_activeMutex);
+        g_active = newActive;
+    }
+    g_idleActive.store(false, std::memory_order_relaxed);
+}
+
+static void clearBuffers(bool clearActive, bool clearStaging)
+{
+    if (clearActive)
+    {
+        std::lock_guard<std::mutex> lock(g_activeMutex);
+        g_active.reset();
+    }
+    if (clearStaging)
+    {
+        std::lock_guard<std::mutex> lock(g_stagingMutex);
+        g_staging.clear();
+    }
+}
+
+// ------------------------------------------------------------
+// Binary packet parser
+// ------------------------------------------------------------
+class BinaryParser
+{
+public:
+    void Reset()
+    {
+        state_ = State::Sync;
+        preambleIndex_ = 0;
+        payload_.clear();
+        payloadNeeded_ = 0;
+        expectCrc_ = false;
+        cmd_ = 0;
+        flags_ = 0;
+        lenWords_ = 0;
+    }
+
+    void ProcessByte(uint8_t byte)
+    {
+        switch (state_)
+        {
+        case State::Sync:
+            handleSync(byte);
+            break;
+        case State::Cmd:
+            cmd_ = byte;
+            state_ = State::Flags;
+            break;
+        case State::Flags:
+            flags_ = byte;
+            state_ = State::Len0;
+            break;
+        case State::Len0:
+            lenWords_ = byte;
+            state_ = State::Len1;
+            break;
+        case State::Len1:
+            lenWords_ |= (uint16_t)byte << 8;
+            payloadNeeded_ = (size_t)lenWords_ * 2u;
+            expectCrc_ = (flags_ & 0x01) != 0;
+            payload_.clear();
+            if (payloadNeeded_ > kMaxPayloadBytes)
+            {
+                g_stats.parse_resyncs.fetch_add(1, std::memory_order_relaxed);
+                Reset();
+                break;
+            }
+            if (payloadNeeded_ == 0)
+            {
+                state_ = expectCrc_ ? State::Crc0 : State::Dispatch;
+            }
+            else
+            {
+                state_ = State::Payload;
+            }
+            break;
+        case State::Payload:
+            payload_.push_back(byte);
+            if (payload_.size() >= payloadNeeded_)
+            {
+                state_ = expectCrc_ ? State::Crc0 : State::Dispatch;
+            }
+            break;
+        case State::Crc0:
+            crcBytes_[0] = byte;
+            state_ = State::Crc1;
+            break;
+        case State::Crc1:
+            crcBytes_[1] = byte;
+            state_ = State::Dispatch;
+            break;
+        case State::Dispatch:
+            Reset();
+            break;
+        }
+
+        if (state_ == State::Dispatch)
+        {
+            dispatchPacket();
+            Reset();
+        }
+    }
+
+private:
+    static constexpr size_t kMaxPayloadBytes = 128 * 1024;
+    enum class State
+    {
+        Sync,
+        Cmd,
+        Flags,
+        Len0,
+        Len1,
+        Payload,
+        Crc0,
+        Crc1,
+        Dispatch
     };
 
-    const uint16_t maxc = coordMax();
-    const float cx = (float)maxc * 0.5f;
-    const float cy = (float)maxc * 0.5f;
-
-    const int kStarCount = 400;
-    const float fieldRadius = 0.25f;   // wider emission cone
-    const float zNear = 0.1f;
-    const float zFar = 2.0f;
-    const float speed = 1.25f;        // depth units per second (2x faster)
-    const float focal = (float)maxc * 1.4f;
-
-    static std::vector<Star> stars;
-    static uint32_t lastMs = 0;
-
-    if (g_starfieldReset.exchange(false, std::memory_order_relaxed) || stars.size() != kStarCount) {
-        stars.resize(kStarCount);
-        for (int i = 0; i < kStarCount; ++i) {
-            stars[i].x = (random(-1000, 1000) / 1000.0f) * fieldRadius;
-            stars[i].y = (random(-1000, 1000) / 1000.0f) * fieldRadius;
-            stars[i].z = zNear + (random(0, 1000) / 1000.0f) * (zFar - zNear);
-        }
-        lastMs = millis();
-    }
-
-    const uint32_t now = millis();
-    const float dt = (lastMs == 0) ? 0.0f : (float)(now - lastMs) / 1000.0f;
-    lastMs = now;
-
-    for (int i = 0; i < kStarCount; ++i) {
-        Star &s = stars[i];
-        s.z -= speed * dt;
-        if (s.z < zNear) {
-            s.z = zFar;
-            s.x = (random(-1000, 1000) / 1000.0f) * fieldRadius;
-            s.y = (random(-1000, 1000) / 1000.0f) * fieldRadius;
-        }
-
-        const float px = cx + (s.x * focal) / s.z;
-        const float py = cy + (s.y * focal) / s.z;
-
-        if (px >= 0.0f && px <= (float)maxc && py >= 0.0f && py <= (float)maxc) {
-            const float depthT = (zFar - s.z) / (zFar - zNear); // 0..1, near = 1
-            const float minTrail = 1.0f;
-            const float maxTrail = 50.0f;
-            const float trailLen = minTrail + (maxTrail - minTrail) * depthT;
-
-            float dx = cx - px;
-            float dy = cy - py;
-            const float dist = sqrtf(dx * dx + dy * dy);
-            if (dist > 0.001f) {
-                dx /= dist;
-                dy /= dist;
-            }
-
-            const float tx = px + dx * trailLen;
-            const float ty = py + dy * trailLen;
-
-            const uint16_t x0 = clampCoord((int32_t)lroundf(px));
-            const uint16_t y0 = clampCoord((int32_t)lroundf(py));
-            const uint16_t x1 = clampCoord((int32_t)lroundf(tx));
-            const uint16_t y1 = clampCoord((int32_t)lroundf(ty));
-            hpMoveTo(x0, y0);
-            hpLineTo(x1, y1);
-        }
-    }
-}
-
-// TestCase7: spirograph pattern.
-static void TestCase7()
-{
-    // Spirograph (hypotrochoid) pattern
-    const uint16_t maxc = coordMax();
-    const uint16_t cx = maxc / 2;
-    const uint16_t cy = maxc / 2;
-
-    // Spirograph parameters (in arbitrary units)
-    const float R = 150.0f;
-    const float r = 105.0f;
-    const float d = 75.0f;
-
-    // Limit to ~200 vectors to keep framerate
-    const int segments = 200;
-
-    // Determine a reasonable closure period
-    const float gcd = 15.0f; // gcd(R, r)
-    const float turns = r / gcd;
-    const float tMax = 2.0f * 3.14159f * turns;
-
-    // Scale to screen
-    const float span = (R - r) + d;
-    const float scale = (maxc * 0.42f) / span;
-
-    // Spin over time
-    const float spinSpeed = 1.0f; // radians/sec
-    const float angle = (float)millis() * 0.001f * spinSpeed;
-    const float cosA = cosf(angle);
-    const float sinA = sinf(angle);
-
-    bool first = true;
-    for (int i = 0; i <= segments; ++i) {
-        const float t = (tMax * i) / segments;
-        const float k = (R - r) / r;
-        const float x = (R - r) * cosf(t) + d * cosf(k * t);
-        const float y = (R - r) * sinf(t) - d * sinf(k * t);
-        const float xr = x * cosA - y * sinA;
-        const float yr = x * sinA + y * cosA;
-
-        const uint16_t sx = clampCoord((int32_t)lroundf(cx + xr * scale));
-        const uint16_t sy = clampCoord((int32_t)lroundf(cy + yr * scale));
-
-        if (first) {
-            hpMoveTo(sx, sy);
-            first = false;
-        } else {
-            hpLineTo(sx, sy);
-        }
-    }
-}
-
-// TestCase8: checkerboard outline.
-static void TestCase8()
-{
-    // Checkerboard (outlined squares)
-    const uint16_t maxc = coordMax();
-    const uint16_t margin = 120;
-    const int rows = 6;
-    const int cols = 6;
-    const uint16_t cellW = (maxc - (margin * 2)) / cols;
-    const uint16_t cellH = (maxc - (margin * 2)) / rows;
-
-    for (int r = 0; r < rows; ++r) {
-        for (int c = 0; c < cols; ++c) {
-            if (((r + c) & 1) == 0) {
-                const uint16_t x0 = margin + (uint16_t)(c * cellW);
-                const uint16_t y0 = margin + (uint16_t)(r * cellH);
-                const uint16_t x1 = x0 + cellW;
-                const uint16_t y1 = y0 + cellH;
-                hpMoveTo(x0, y0);
-                hpLineTo(x1, y0);
-                hpLineTo(x1, y1);
-                hpLineTo(x0, y1);
-                hpLineTo(x0, y0);
+    void handleSync(uint8_t byte)
+    {
+        static const uint8_t preamble[4] = {0xA5, 0x5A, 0xC3, 0x3C};
+        if (byte == preamble[preambleIndex_])
+        {
+            preambleIndex_++;
+            if (preambleIndex_ == 4)
+            {
+                state_ = State::Cmd;
+                preambleIndex_ = 0;
             }
         }
+        else
+        {
+            if (preambleIndex_ != 0)
+            {
+                g_stats.parse_resyncs.fetch_add(1, std::memory_order_relaxed);
+            }
+            preambleIndex_ = (byte == preamble[0]) ? 1 : 0;
+        }
+    }
+
+    void dispatchPacket()
+    {
+        if (expectCrc_)
+        {
+            std::vector<uint8_t> crcBuf;
+            crcBuf.reserve(4 + payload_.size());
+            crcBuf.push_back(cmd_);
+            crcBuf.push_back(flags_);
+            crcBuf.push_back((uint8_t)(lenWords_ & 0xFF));
+            crcBuf.push_back((uint8_t)(lenWords_ >> 8));
+            crcBuf.insert(crcBuf.end(), payload_.begin(), payload_.end());
+
+            const uint16_t received =
+                (uint16_t)crcBytes_[0] | ((uint16_t)crcBytes_[1] << 8);
+            const uint16_t computed = crc16_ccitt(crcBuf.data(), crcBuf.size());
+            if (computed != received)
+            {
+                g_stats.packets_bad_crc.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        }
+
+        handleCommand();
+    }
+
+    void handleCommand()
+    {
+        switch (cmd_)
+        {
+        case 0x01: // WRITE_WORDS (append)
+            appendWords(false);
+            break;
+        case 0x02: // REPLACE_WORDS
+            appendWords(true);
+            break;
+        case 0x03: // CLEAR
+            g_loopEnabled.store(false, std::memory_order_relaxed);
+            clearBuffers(true, true);
+            break;
+        case 0x04: // COMMIT_ONCE
+            g_loopEnabled.store(false, std::memory_order_relaxed);
+            swapStagingToActive();
+            break;
+        case 0x05:
+        { // COMMIT_LOOP
+            uint16_t hz = 60;
+            if (lenWords_ >= 1)
+            {
+                hz = (uint16_t)((payload_[1] << 8) | payload_[0]);
+            }
+            swapStagingToActive();
+            g_loopHz.store(hz, std::memory_order_relaxed);
+            g_loopEnabled.store(true, std::memory_order_relaxed);
+            g_lastLoopMs.store(0, std::memory_order_relaxed);
+            break;
+        }
+        case 0x06: // STOP_LOOP
+            g_loopEnabled.store(false, std::memory_order_relaxed);
+            break;
+        case 0x07:
+        { // SET_MODE
+            uint16_t modeWord = 0;
+            if (lenWords_ >= 1)
+            {
+                modeWord = (uint16_t)((payload_[1] << 8) | payload_[0]);
+            }
+            (void)modeWord;
+            break;
+        }
+        case 0x08: // DEBUG: Toggle swap enable
+        {
+            bool newState = !g_swapEnabled.load(std::memory_order_relaxed);
+            g_swapEnabled.store(newState, std::memory_order_relaxed);
+            Serial.printf("\n*** SWAP %s ***\n", newState ? "ENABLED" : "DISABLED");
+            break;
+        }
+        default:
+            break;
+        }
+
+        g_lastRxMs.store(millis(), std::memory_order_relaxed);
+        g_stats.packets_ok.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void appendWords(bool replace)
+    {
+        const size_t wordCount = lenWords_;
+        if (wordCount == 0)
+            return;
+
+        std::vector<uint16_t> words;
+        words.reserve(wordCount);
+        for (size_t i = 0; i < wordCount; ++i)
+        {
+            const size_t idx = i * 2;
+            const uint16_t w =
+                (uint16_t)payload_[idx] | ((uint16_t)payload_[idx + 1] << 8);
+            words.push_back(w);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_stagingMutex);
+            if (replace)
+            {
+                g_staging = std::move(words);  // Move, don't copy
+            }
+            else
+            {
+                g_staging.insert(g_staging.end(), words.begin(), words.end());
+            }
+        }
+
+        g_stats.words_received.fetch_add((uint32_t)wordCount,
+                                         std::memory_order_relaxed);
+    }
+
+    State state_ = State::Sync;
+    uint8_t preambleIndex_ = 0;
+    uint8_t cmd_ = 0;
+    uint8_t flags_ = 0;
+    uint16_t lenWords_ = 0;
+    size_t payloadNeeded_ = 0;
+    bool expectCrc_ = false;
+    uint8_t crcBytes_[2] = {0, 0};
+    std::vector<uint8_t> payload_;
+};
+
+static BinaryParser g_parser;
+
+// ------------------------------------------------------------
+// Console mode
+// ------------------------------------------------------------
+static void consolePrintln(const char *msg)
+{
+    Serial.print(msg);
+    Serial.print("\r\n");
+}
+
+static void consolePrintf(const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    Serial.vprintf(fmt, args);
+    va_end(args);
+    Serial.print("\r\n");
+}
+
+static void enterConsoleMode()
+{
+    g_mode.store(UIMode::Console, std::memory_order_relaxed);
+    g_hp.SetQuiet(false);
+    consolePrintln("");
+    consolePrintln("== HP1345A console ==");
+    consolePrintln("Commands: ?,help, stat, clear, once, loop <hz>, stop, arm, "
+                   "disarm, bin, r, pentest, bittest <n>, rawpen");
+    Serial.print("> ");
+}
+
+static void returnToBinaryMode()
+{
+    g_hp.SetQuiet(true);
+    g_mode.store(UIMode::Binary, std::memory_order_relaxed);
+    g_parser.Reset();
+    resetEscapeDetector();
+}
+
+// ------------------------------------------------------------
+// OLED status task - runs on Core 1
+// ------------------------------------------------------------
+static void ScreenTask(void *param)
+{
+    (void)param;
+    g_screenLastMs = millis();
+    while (true)
+    {
+        const UIMode mode = g_mode.load(std::memory_order_relaxed);
+        const uint32_t nowMs = millis();
+        const uint32_t frames = g_stats.frames_rendered.load(std::memory_order_relaxed);
+        const uint32_t dt = nowMs - g_screenLastMs;
+        uint32_t fps_x10 = 0;
+        if (dt > 0)
+        {
+            fps_x10 = (uint32_t)(((frames - g_screenLastFrames) * 10000u) / dt);
+        }
+        g_screenLastFrames = frames;
+        g_screenLastMs = nowMs;
+
+        const size_t wordsPerFrame = activeWordCount();
+        const uint32_t vecPerFrame = (uint32_t)(wordsPerFrame / 4u);
+        const uint32_t vecPerSec = (uint32_t)((vecPerFrame * (uint64_t)fps_x10) / 10u);
+        snprintf(g_modeLine, sizeof(g_modeLine), "Mode: %s",
+                 (mode == UIMode::Binary) ? "Binary" : "Console");
+        snprintf(g_fpsLine, sizeof(g_fpsLine), "FPS: %lu",
+                 (unsigned long)(round(fps_x10 / 10.0)));
+        snprintf(g_vecLine, sizeof(g_vecLine), "Vec/s: %lu",
+                 (unsigned long)vecPerSec);
+
+        g_screen.Clear();
+        g_screen.DrawBorder();
+        g_screen.DrawLines(g_modeLine, g_fpsLine, g_vecLine);
+        g_screen.Render();
+
+        vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
 
-// TestCase9: Matrix-style falling characters.
-static void TestCase9()
+// ------------------------------------------------------------
+// Serial task - runs on Core 0, handles incoming data
+// ------------------------------------------------------------
+static void handleConsoleLine(const char *line);
+static void pollConsoleInput();
+
+static void SerialTask(void *param)
 {
-    // Matrix-style falling characters (smooth drift)
-    struct MatrixDrop {
-        float x;
-        float y;
-        float speed;
-        char ch;
-        uint32_t nextChangeMs;
+    (void)param;
+    uint32_t lastOkPackets = g_stats.packets_ok.load(std::memory_order_relaxed);
+    
+    while (true)
+    {
+        const UIMode mode = g_mode.load(std::memory_order_relaxed);
+        const uint32_t now = millis();
+        bool sawPacket = false;
+
+        if (mode == UIMode::Binary)
+        {
+            // Read all available bytes as fast as possible
+            int avail = Serial.available();
+            if (avail > 0)
+            {
+                // Process all currently available bytes in one burst
+                while (avail > 0)
+                {
+                    const uint8_t b = (uint8_t)Serial.read();
+                    const uint32_t tnow = millis();
+                    
+                    feedEscapeDetector(b, tnow);
+                    g_parser.ProcessByte(b);
+                    avail--;
+                    const uint32_t okNow =
+                        g_stats.packets_ok.load(std::memory_order_relaxed);
+                    if (okNow != lastOkPackets)
+                    {
+                        sawPacket = true;
+                        lastOkPackets = okNow;
+                    }
+                }
+                // Yield after processing batch to let IDLE0 feed watchdog
+                // At 921600 baud (~92 bytes/ms) with 8KB buffer, 1ms delay is safe
+                vTaskDelay(1);
+            }
+            else
+            {
+                // Only delay when no data available
+                vTaskDelay(1);
+            }
+            if (escapeGuard2Satisfied(now))
+            {
+                enterConsoleMode();
+            }
+        }
+        else
+        {
+            pollConsoleInput();
+            //vTaskDelay(1);
+        }
+
+        if (sawPacket)
+        {
+            g_lastRxMs.store(now, std::memory_order_relaxed);
+        }
+    }
+}
+
+static void handleConsoleLine(const char *line)
+{
+    char buf[96];
+    size_t len = 0;
+    for (const char *p = line; *p && len < sizeof(buf) - 1; ++p)
+    {
+        if (*p == '\r' || *p == '\n')
+            continue;
+        buf[len++] = (char)tolower((unsigned char)*p);
+    }
+    buf[len] = '\0';
+    if (len == 0)
+    {
+        Serial.print("> ");
+        return;
+    }
+
+    auto startsWith = [&](const char *prefix) -> bool
+    {
+        const size_t l = strlen(prefix);
+        return len >= l && strncmp(buf, prefix, l) == 0;
     };
 
-    static std::vector<MatrixDrop> drops;
-    static bool initialized = false;
-    static uint32_t lastMs = 0;
-
-    const uint16_t maxc = coordMax();
-    const float bottomY = -40.0f;
-    const float charHeight = 144.0f;  // 2X size
-    const float marginX = 60.0f;
-    const float topY = (float)maxc - charHeight - 1;
-
-
-    const char *kChars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ#$%&@*+-";
-    const int kCharCount = 10 + 26 + 8;
-
-    const int columnCount = 20;
-    const float colSpacing = (float)(maxc - (uint16_t)(marginX * 2.0f)) / (float)(columnCount - 1);
-
-    if (!initialized) {
-        drops.clear();
-        drops.reserve(columnCount);
-        for (int i = 0; i < columnCount; ++i) {
-            MatrixDrop d;
-            d.x = marginX + (float)i * colSpacing;
-            d.y = topY;
-            d.speed = 240.0f + (float)random(0, 480);  // 4X faster
-            d.ch = kChars[random(0, kCharCount)];
-            d.nextChangeMs = millis() + (uint32_t)random(80, 260);
-            drops.push_back(d);
+    if (buf[0] == '?' || startsWith("help"))
+    {
+        consolePrintln("Commands: ?,help, stat, clear, once, loop <hz>, stop, arm, "
+                       "disarm, bin, r, pentest, bittest <n>, rawpen");
+    }
+    else if (startsWith("stat"))
+    {
+        const auto mode = g_mode.load(std::memory_order_relaxed);
+        const bool loop = g_loopEnabled.load(std::memory_order_relaxed);
+        uint16_t hz = g_loopHz.load(std::memory_order_relaxed);
+        size_t stagingSize = 0, activeSize = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_stagingMutex);
+            stagingSize = g_staging.size();
         }
-        lastMs = millis();
-        initialized = true;
+        {
+            std::lock_guard<std::mutex> lock(g_activeMutex);
+            activeSize = g_active ? g_active->size() : 0;
+        }
+        consolePrintf("mode=%s  loop=%s hz=%u  staging=%u words  active=%u words",
+                      (mode == UIMode::Binary) ? "binary" : "console",
+                      loop ? "on" : "off", (unsigned)hz, (unsigned)stagingSize,
+                      (unsigned)activeSize);
+        consolePrintf(
+            "packets: ok=%lu crc_fail=%lu resync=%lu",
+            (unsigned long)g_stats.packets_ok.load(std::memory_order_relaxed),
+            (unsigned long)g_stats.packets_bad_crc.load(std::memory_order_relaxed),
+            (unsigned long)g_stats.parse_resyncs.load(std::memory_order_relaxed));
+        consolePrintf(
+            "playback: frames=%lu timeouts=%lu  words_rx=%lu",
+            (unsigned long)g_stats.frames_rendered.load(std::memory_order_relaxed),
+            (unsigned long)g_stats.playback_timeouts.load(std::memory_order_relaxed),
+            (unsigned long)g_stats.words_received.load(std::memory_order_relaxed));
+    }
+    else if (startsWith("clear"))
+    {
+        g_loopEnabled.store(false, std::memory_order_relaxed);
+        clearBuffers(true, true);
+        consolePrintln("Cleared buffers.");
+    }
+    else if (startsWith("once"))
+    {
+        g_loopEnabled.store(false, std::memory_order_relaxed);
+        swapStagingToActive();
+        consolePrintln("Played active buffer once.");
+    }
+    else if (startsWith("loop"))
+    {
+        uint16_t hz = 60;
+        char *endp = nullptr;
+        const char *num = strchr(buf, ' ');
+        if (num)
+        {
+            hz = (uint16_t)strtoul(num + 1, &endp, 10);
+        }
+        swapStagingToActive();
+        g_loopHz.store(hz, std::memory_order_relaxed);
+        g_loopEnabled.store(true, std::memory_order_relaxed);
+        g_lastLoopMs.store(0, std::memory_order_relaxed);
+        consolePrintf("Looping active buffer at %u Hz (0=fast).", (unsigned)hz);
+    }
+    else if (startsWith("stop"))
+    {
+        g_loopEnabled.store(false, std::memory_order_relaxed);
+        consolePrintln("Loop stopped.");
+    }
+    else if (startsWith("arm"))
+    {
+        g_hp.SetTransfersEnabled(true);
+        consolePrintln("Bus armed (transfers enabled).");
+    }
+    else if (startsWith("disarm"))
+    {
+        g_hp.SetTransfersEnabled(false);
+        consolePrintln("Bus disarmed (transfers paused).");
+    }
+    else if (startsWith("bin") || startsWith("r"))
+    {
+        consolePrintln("Returning to binary mode.");
+        returnToBinaryMode();
+        return;
+    }
+    else if (startsWith("pentest"))
+    {
+        // Draw a pattern that alternates pen up/down to test bit 11 (GPIO 37)
+        consolePrintln("Pen test: Drawing 5 separate horizontal lines...");
+        consolePrintln("If wiring is correct, you should see 5 SEPARATE lines.");
+        consolePrintln("If bit 11 is stuck, you'll see one connected zigzag.");
+        
+        g_loopEnabled.store(false, std::memory_order_relaxed);
+        
+        // Clear and draw test pattern directly
+        const uint16_t PEN_UP = 0x0000;   // bit 11 = 0 (move)
+        const uint16_t PEN_DOWN = 0x0800; // bit 11 = 1 (draw)
+        
+        for (int i = 0; i < 5; i++)
+        {
+            uint16_t y = 500 + i * 200;  // Y positions: 500, 700, 900, 1100, 1300
+            
+            // Move to start (pen UP)
+            g_hp.SendWord(200 | PEN_UP);        // X low
+            g_hp.SendWord(y | PEN_UP);          // Y low  
+            
+            // Draw to end (pen DOWN)
+            g_hp.SendWord(1800 | PEN_DOWN);     // X high
+            g_hp.SendWord(y | PEN_DOWN);        // Y high
+        }
+        consolePrintln("Pen test complete.");
+    }
+    else if (startsWith("bittest"))
+    {
+        // Test individual data bits
+        char *endp = nullptr;
+        const char *num = strchr(buf, ' ');
+        if (!num)
+        {
+            consolePrintln("Usage: bittest <bit_number 0-14>");
+            consolePrintln("Bit 11 (GPIO 37) = pen state");
+            Serial.print("> ");
+            return;
+        }
+        int bit = (int)strtol(num + 1, &endp, 10);
+        if (bit < 0 || bit > 14)
+        {
+            consolePrintln("Bit must be 0-14");
+            Serial.print("> ");
+            return;
+        }
+        
+        uint16_t word = (1u << bit);
+        consolePrintf("Sending word 0x%04X (bit %d set)", word, bit);
+        consolePrintf("GPIO for bit %d = pin %d", bit, kHpPins.data[bit]);
+        
+        // Send several times to make it visible on scope
+        for (int i = 0; i < 100; i++)
+        {
+            g_hp.SendWord(word);
+            g_hp.SendWord(0x0000);
+        }
+        consolePrintln("Done - check with scope on that GPIO.");
+    }
+    else if (startsWith("rawpen"))
+    {
+        // Send raw words with explicit pen control for debugging
+        consolePrintln("Sending raw pen test...");
+        consolePrintln("Move to (100,100) pen UP, then draw to (1900,100) pen DOWN");
+        
+        // Pen UP move
+        g_hp.SendWord(100);          // X=100, bit11=0 (pen up)
+        g_hp.SendWord(100);          // Y=100, bit11=0 (pen up)
+        
+        // Pen DOWN draw  
+        g_hp.SendWord(1900 | 0x0800); // X=1900, bit11=1 (pen down)
+        g_hp.SendWord(100 | 0x0800);  // Y=100, bit11=1 (pen down)
+        
+        consolePrintln("If pen works: single horizontal line at Y=100");
+        consolePrintln("If pen stuck DOWN: line from origin to (100,100) to (1900,100)");
+        consolePrintln("If pen stuck UP: nothing visible");
+    }
+    else
+    {
+        consolePrintln("Unknown command. Type 'help' for list.");
     }
 
-    const uint32_t now = millis();
-    const float dt = (lastMs == 0) ? 0.0f : (float)(now - lastMs) / 1000.0f;
-    lastMs = now;
-
-    char buf[2] = {'?', '\0'};
-    for (MatrixDrop &d : drops) {
-        d.y -= d.speed * dt;
-        if (d.y < bottomY) {
-            d.y = topY;
-            d.speed = 500.0f + (float)random(0, 560);
-        }
-
-        if (now >= d.nextChangeMs) {
-            d.ch = kChars[random(0, kCharCount)];
-            d.nextChangeMs = now + (uint32_t)random(80, 260);
-        }
-
-        if (d.y >= 0.0f && d.y <= (float)maxc) {
-            buf[0] = d.ch;
-            drawTextAtSized(
-                clampCoord((int32_t)lroundf(d.x)),
-                clampCoord((int32_t)lroundf(d.y)),
-                buf,
-                2,  // 2X size
-                0
-            );
-        }
-    }
+    Serial.print("> ");
 }
 
-// Dispatch the selected test pattern.
-static void RunTestCase(uint8_t idx)
+static void pollConsoleInput()
 {
-    static uint8_t lastIdx = 0xFF;
-    if (idx != lastIdx) {
-        if (idx == 6) {
-            g_starfieldReset.store(true, std::memory_order_relaxed);
+    static char lineBuf[96];
+    static size_t lineLen = 0;
+    while (Serial.available() > 0)
+    {
+        const int c = Serial.read();
+        if (c < 0)
+            break;
+        if (c == '\r' || c == '\n')
+        {
+            Serial.print("\r\n");
+            lineBuf[lineLen] = '\0';
+            handleConsoleLine(lineBuf);
+            lineLen = 0;
+            continue;
         }
-        lastIdx = idx;
-    }
-    switch (idx) {
-        case 0: TestCase0(); break;
-        case 1: TestCase1(); break;
-        case 2: TestCase2(); break;
-        case 3: TestCase3(); break;
-        case 4: TestCase4(); break;
-        case 5: TestCase5(); break;
-        case 6: TestCase6(); break;
-        case 7: TestCase7(); break;
-        case 8: TestCase8(); break;
-        case 9: TestCase9(); break;
-        default: TestCase0(); break;
+        if (c == '\b' || c == 0x7F)
+        {
+            if (lineLen > 0)
+            {
+                lineLen--;
+                Serial.print("\b \b");
+            }
+            continue;
+        }
+        if (lineLen < sizeof(lineBuf) - 1)
+        {
+            lineBuf[lineLen++] = (char)c;
+            Serial.write((char)c);
+        }
     }
 }
 
-// HP pin configuration now lives inside HPVectorDevice.
+// ------------------------------------------------------------
+// Arduino setup/loop
+// ------------------------------------------------------------
 
-// Arduino setup: initialize IO, OLED, and HP display.
+// Serial baud rate - must match client hptest.py and platformio.ini monitor_speed
+static constexpr uint32_t kSerialBaud = 921600;
+
 void setup()
 {
-    Serial.begin(115200);
-    delay(200);
+    // Increase RX buffer to handle large packets at high baud rate
+    Serial.setRxBufferSize(8192);
+    Serial.begin(kSerialBaud);
+    delay(100);
 
-    Serial.println();
-    Serial.println("HP1345A Immediate-Mode Handshake Exerciser");
-    Serial.println("Wiring reminders:");
-    Serial.println(" - HP DISCONNECT SENSE pin must be tied to GND");
-    Serial.println(" - Protect RFD input with resistor divider (5V -> 3.3V)");
-    Serial.println(" - Tie grounds together (HP GND to ESP32 GND)");
-    Serial.println();
-
-    g_hp.SetServiceCallback(serviceCommandsForWait);
+    g_hp.SetQuiet(true);
+    g_hp.SetServiceCallback(nullptr);
     g_hp.ConfigurePins();
+    g_hp.InitializeDisplay();
+    g_hp.SetPenInvert(false);  // HP1345A: bit11=1 means pen DOWN
 
-    Serial.println("Send 'd' to pulse DAV low for 500ms (wiring check on HP pin 10).");
-    Serial.println("Send 's' to print bus status.");
-    Serial.println("Send 'h' for help.");
-
-    Serial.println("Initializing OLED...");
-    if (g_screen.Init()) {
+    // Initialize OLED and start screen task on Core 1
+    const bool oledOk = g_screen.Init();
+    if (oledOk)
+    {
         g_screen.Clear();
         g_screen.DrawBorder();
         g_screen.Render();
-        Serial.println("OLED ready.");
-    } else {
-        Serial.println("OLED init failed. Scanning common I2C pin pairs first (avoid blocking init)...");
-        const int sdaPins[] = {17, 8, 21};
-        const int sclPins[] = {18, 9, 22};
-        bool found = false;
-        for (size_t i = 0; i < (sizeof(sdaPins) / sizeof(sdaPins[0])); ++i) {
-            const int sda = sdaPins[i];
-            const int scl = sclPins[i];
-            Serial.printf("Scan SDA=%d SCL=%d\n", sda, scl);
-            // Try common OLED addresses first to avoid scan issues on some boards.
-            const uint8_t tryAddrs[] = {0x3C, 0x3D};
-            for (size_t a = 0; a < (sizeof(tryAddrs) / sizeof(tryAddrs[0])); ++a) {
-                const uint8_t addr = tryAddrs[a];
-                Serial.printf("Try OLED init at 0x%02X on SDA=%d SCL=%d\n", addr, sda, scl);
-                if (g_screen.InitWithPins(sda, scl, addr)) {
-                    g_screen.Clear();
-                    g_screen.DrawBorder();
-                    g_screen.Render();
-                    Serial.println("OLED ready after direct init.");
-                    found = true;
-                    break;
-                }
-            }
-            if (found) break;
-
-            const uint8_t addr = g_screen.Scan(sda, scl);
-            if (addr != 0) {
-                Serial.printf("I2C device found at 0x%02X on SDA=%d SCL=%d\n", addr, sda, scl);
-                Serial.println("Initializing OLED on detected bus...");
-                if (g_screen.InitWithPins(sda, scl, addr)) {
-                    g_screen.Clear();
-                    g_screen.DrawBorder();
-                    g_screen.Render();
-                    Serial.println("OLED ready after scan.");
-                    found = true;
-                    break;
-                }
-                Serial.println("OLED init failed on detected bus.");
-            } else {
-                Serial.printf("No I2C device found on SDA=%d SCL=%d\n", sda, scl);
-            }
-        }
-    if (!found) {
-        Serial.println("No OLED detected. Set SCREEN_SDA/SCREEN_SCL/SCREEN_ADDR or confirm OLED controller.");
-    }
+        xTaskCreatePinnedToCore(
+            ScreenTask,
+            "ScreenTask",
+            4096,
+            nullptr,
+            1,  // Low priority
+            &g_screenTask,
+            1); // Core 1
     }
 
-    // Start screen update thread after OLED init path completes.
-    g_screenThread = std::thread(ScreenThread);
-    g_screenThread.detach();
+    // Start drawing/loop task on Core 1 - completely isolated from serial
+    xTaskCreatePinnedToCore(
+        LoopTask,
+        "LoopTask",
+        8192,
+        nullptr,
+        2,  // Medium priority for rendering
+        &g_loopTask,
+        1); // Core 1 - dedicated to drawing
 
-    Serial.printf("DAV=%d (OUT), RFD=%d (IN)\n", kHpPins.dav, kHpPins.rfd);
-    Serial.print("DATA pins D0..D14: ");
-    for (int i = 0; i < 15; ++i) {
-        Serial.printf("%d%s", kHpPins.data[i], (i == 14) ? "\n" : ",");
-    }
+    // Start serial task on Core 0 - handles all serial I/O
+    xTaskCreatePinnedToCore(
+        SerialTask,
+        "SerialTask",
+        8192,
+        nullptr,
+        9,  // Higher priority to drain serial buffer
+        &g_serialTask,
+        0); // Core 0 - dedicated to serial
 
-    Serial.printf("Initial RFD level = %d (0=ready/LOW)\n", g_hp.RfdRaw());
-    Serial.println("HP1345A Plot-mode word format: X word=0x0xxx, Y word=0x1yyy (pen=bit11)");
-    
-    // Initialize HP1345A display state (intensity, focus, etc.)
-    g_hp.InitializeDisplay();
-    
-    Serial.println("Starting transfers...\n");
+    resetEscapeDetector();
+    g_parser.Reset();
+
+    Serial.printf("HP1345A streamer ready (binary) - built %s %s\n", __DATE__, __TIME__);
+    Serial.println("Send pause+++pause to enter console.");
 }
 
-// Arduino loop: draw the active test pattern and overlay stats.
 void loop()
 {
-    // Always service commands first (and frequently during waits).
-    serviceSerialCommands(true);
-
-    if (g_hp.TransfersEnabled()) {
-        g_frameVectorCount = 0;
-        RunTestCase(g_testIndex.load(std::memory_order_relaxed));
-        g_lastVectorCount = g_frameVectorCount;
-        updateFpsText();
-        // Top-left text: position accounts for 1X character height (~36)
-        const uint16_t x = 12;
-        const uint16_t y = coordMax() - 40;
-        drawTextAt(x, y, g_statsText);
-    } else {
-        delay(20);
-        return;
-    }
+    // All work is handled by FreeRTOS tasks
+    vTaskDelay(pdMS_TO_TICKS(100));
 }

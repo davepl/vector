@@ -30,7 +30,7 @@ void HPVectorDevice::ConfigurePins()
 // Send display setup commands (brightness, focus, writing rate).
 void HPVectorDevice::InitializeDisplay()
 {
-    Serial.println("Initializing HP1345A display state...");
+    if (!Quiet()) Serial.println("Initializing HP1345A display state...");
 
     SendWord(0x63FFu);  // Intensity max (param 000, value 0x3FF)
     SendWord(0x6FFFu);  // Extra bits set (safety for undocumented behavior)
@@ -40,7 +40,7 @@ void HPVectorDevice::InitializeDisplay()
     SendWord(MakeXWord(0, false));
     SendWord(MakeYWord(0, false));
 
-    Serial.println("HP1345A initialized.");
+    if (!Quiet()) Serial.println("HP1345A initialized.");
 }
 
 // Register a lightweight callback to service commands during waits.
@@ -98,6 +98,16 @@ void HPVectorDevice::SetPenInvert(bool invert)
 bool HPVectorDevice::PenInvert() const
 {
     return penInvert_.load(std::memory_order_relaxed);
+}
+
+void HPVectorDevice::SetQuiet(bool quiet)
+{
+    quiet_.store(quiet, std::memory_order_relaxed);
+}
+
+bool HPVectorDevice::Quiet() const
+{
+    return quiet_.load(std::memory_order_relaxed);
 }
 
 void HPVectorDevice::SetRfdActiveLow(bool activeLow)
@@ -217,7 +227,7 @@ bool HPVectorDevice::SendWord(uint16_t word)
             connected_.store(false, std::memory_order_relaxed);
         }
         const uint32_t now = millis();
-        if (now - lastTimeoutReportMs_ > 1000) {
+        if (!Quiet() && now - lastTimeoutReportMs_ > 1000) {
             lastTimeoutReportMs_ = now;
             Serial.println("TIMEOUT waiting for RFD transition. Check DISCONNECT SENSE=GND, RFD wiring, and divider.");
         }
@@ -243,6 +253,22 @@ void HPVectorDevice::LineTo(uint16_t x, uint16_t y)
     SendWord(MakeYWord(y, true));
     curX_ = x;
     curY_ = y;
+    vectorCount_++;
+}
+
+uint32_t HPVectorDevice::VectorCount() const
+{
+    return vectorCount_;
+}
+
+void HPVectorDevice::ResetVectorCount()
+{
+    vectorCount_ = 0;
+}
+
+void HPVectorDevice::AddVectorCount(uint32_t count)
+{
+    vectorCount_ += count;
 }
 
 // Draw text with explicit size/rotation.
@@ -274,24 +300,6 @@ void HPVectorDevice::PulseDavLowMs(uint32_t holdMs)
     digitalWrite(pins_.dav, HIGH);
 }
 
-// Toggle D11 for probing on the HP connector.
-void HPVectorDevice::ToggleD11ForWiringCheck(Stream& out)
-{
-    const int pin = pins_.data[11];
-    out.printf("Toggling D11 (pen bit) on GPIO%d - probe this pin and HP D11\n", pin);
-    out.println("Press any key to stop...");
-    while (!Serial.available()) {
-        digitalWrite(pin, HIGH);
-        out.print("D11=HIGH ");
-        delay(500);
-        digitalWrite(pin, LOW);
-        out.print("D11=LOW ");
-        delay(500);
-    }
-    while (Serial.available()) Serial.read();
-    out.println("\nD11 toggle stopped.");
-}
-
 bool HPVectorDevice::RfdAsserted() const
 {
     const int raw = RfdRaw();
@@ -305,16 +313,18 @@ bool HPVectorDevice::WaitForRfdAsserted(uint32_t timeoutUs)
     while (!RfdAsserted()) {
         if (service_) service_();
         if (abortWaits_.load(std::memory_order_relaxed)) {
-            if (Verbose()) Serial.println("Wait aborted (transfers paused).");
+            if (!Quiet() && Verbose()) Serial.println("Wait aborted (transfers paused).");
             return false;
         }
         if ((micros() - start) > timeoutUs) {
-            Serial.printf("Timeout waiting for RFD asserted, raw RFD=%d (active-%s)\n",
-                          RfdRaw(),
-                          rfdActiveLow_ ? "LOW" : "HIGH");
+            if (!Quiet()) {
+                Serial.printf("Timeout waiting for RFD asserted, raw RFD=%d (active-%s)\n",
+                              RfdRaw(),
+                              rfdActiveLow_ ? "LOW" : "HIGH");
+            }
             return false;
         }
-        if (Verbose()) {
+        if (!Quiet() && Verbose()) {
             const uint32_t now = micros();
             if (now - lastPrint > 250000) {
                 Serial.printf("Waiting for RFD asserted, raw RFD=%d (active-%s), elapsed=%lu us\n",
@@ -336,16 +346,18 @@ bool HPVectorDevice::WaitForRfdDeasserted(uint32_t timeoutUs)
     while (RfdAsserted()) {
         if (service_) service_();
         if (abortWaits_.load(std::memory_order_relaxed)) {
-            if (Verbose()) Serial.println("Wait aborted (transfers paused).");
+            if (!Quiet() && Verbose()) Serial.println("Wait aborted (transfers paused).");
             return false;
         }
         if ((micros() - start) > timeoutUs) {
-            Serial.printf("Timeout waiting for RFD deasserted, raw RFD=%d (active-%s)\n",
-                          RfdRaw(),
-                          rfdActiveLow_ ? "LOW" : "HIGH");
+            if (!Quiet()) {
+                Serial.printf("Timeout waiting for RFD deasserted, raw RFD=%d (active-%s)\n",
+                              RfdRaw(),
+                              rfdActiveLow_ ? "LOW" : "HIGH");
+            }
             return false;
         }
-        if (Verbose()) {
+        if (!Quiet() && Verbose()) {
             const uint32_t now = micros();
             if (now - lastPrint > 250000) {
                 Serial.printf("Waiting for RFD deasserted, raw RFD=%d (active-%s), elapsed=%lu us\n",
@@ -376,7 +388,7 @@ bool HPVectorDevice::SendOneWordImmediate(uint16_t word)
 {
     if (!TransfersEnabled()) return false;
 
-    const bool trace = TraceHandshake();
+    const bool trace = TraceHandshake() && !Quiet();
     if (trace) Serial.printf("Waiting for RFD asserted...\n");
     if (!WaitForRfdAsserted(kTimeoutRfdAssertUs)) return false;
 
