@@ -263,10 +263,13 @@ static bool playbackActiveOnce()
     snprintf(line2, sizeof(line2), "Vec/frame: %lu",
              (unsigned long)vecPerFrame);
     snprintf(line3, sizeof(line3), "Total: %llu",
-             (unsigned long long)totalVec);
-    g_hp.DrawTextAtSized(20, 1950, line1, 1, 0);
-    g_hp.DrawTextAtSized(20, 1880, line2, 1, 0);
-    g_hp.DrawTextAtSized(20, 1810, line3, 1, 0);
+             (unsigned long long)totalVec);\
+
+    #if USE_OSD
+        g_hp.DrawTextAtSized(20, 1950, line1, 1, 0);
+        g_hp.DrawTextAtSized(20, 1880, line2, 1, 0);
+        g_hp.DrawTextAtSized(20, 1810, line3, 1, 0);
+    #endif
 
     g_stats.frames_rendered.fetch_add(1, std::memory_order_relaxed);
     return true;
@@ -485,10 +488,11 @@ static void LoopTask(void *param)
     {
         const uint32_t nowMs = millis();
         const uint32_t lastRx = g_lastRxMs.load(std::memory_order_relaxed);
-        const bool idleTimeout = (lastRx == 0) || ((nowMs - lastRx) > 1000u);
+        const bool idleTimeout = (lastRx == 0) || ((nowMs - lastRx) > 500u);
         if (idleTimeout)
         {
             g_idleActive.store(true, std::memory_order_relaxed);
+            g_loopEnabled.store(false, std::memory_order_relaxed);  // Stop looping on timeout
         }
         if (g_idleActive.load(std::memory_order_relaxed) &&
             !g_loopEnabled.load(std::memory_order_relaxed))

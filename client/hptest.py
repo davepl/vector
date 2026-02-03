@@ -89,6 +89,10 @@ class VectorBuilder:
             | (ch & 0xFF)
         )
 
+    def make_intensity_word(self, intensity: int) -> int:
+        """Make intensity parameter word (param 000, value 0-0x3FF)."""
+        return 0x6000 | (intensity & 0x3FF)
+
     def move_to(self, x: int, y: int) -> None:
         self.words.append(self.make_x_word(x, False))
         self.words.append(self.make_y_word(y, False))
@@ -109,6 +113,10 @@ class VectorBuilder:
             self.pen_down = True
         self.cur_x = x
         self.cur_y = y
+
+    def set_intensity(self, intensity: int) -> None:
+        """Set display intensity (0-0x3FF, where 0x3FF is maximum brightness)."""
+        self.words.append(self.make_intensity_word(intensity))
 
     def text_at(self, x: int, y: int, text: str, size: int = 0, rot: int = 0) -> None:
         if not text:
@@ -169,21 +177,76 @@ def test_2(b: VectorBuilder, t: float) -> None:
 
 
 def test_3(b: VectorBuilder, t: float) -> None:
-    left = 60
-    right = MAXC - 60
-    top = 60
-    bottom = MAXC - 60
-    step = 35
-    b.move_to(left, top)
-    while left + step < right and top + step < bottom:
-        b.line_to(right, top)
-        b.line_to(right, bottom)
-        b.line_to(left, bottom)
-        left += step
-        top += step
-        right -= step
-        bottom -= step
-        b.line_to(left, top)
+    # Spinning wireframe globe
+    vectors = 800  # Configurable target number of vectors (line segments)
+    cx = MAXC * 0.5
+    cy = MAXC * 0.5
+    radius_y = MAXC * 0.47  # Nearly full height
+    radius_x = radius_y * 0.75  # 4:3 correction (skinnier)
+
+    spin = t * 0.6
+    tilt = 0.5
+    cspin, sspin = math.cos(spin), math.sin(spin)
+    ctilt, stilt = math.cos(tilt), math.sin(tilt)
+
+    def rotate_and_project(x: float, y: float, z: float):
+        # Rotate around Y (spin)
+        rx = x * cspin + z * sspin
+        rz = -x * sspin + z * cspin
+        ry = y
+        # Tilt around X
+        ty = ry * ctilt - rz * stilt
+        tz = ry * stilt + rz * ctilt
+        # Simple perspective
+        persp = 1.0 + tz * 0.4
+        px = cx + rx * radius_x * persp
+        py = cy + ty * radius_y * persp
+        return clamp(px), clamp(py)
+
+    # Choose ring counts based on vector budget
+    meridians = max(6, int(math.sqrt(vectors / 2)))
+    parallels = max(4, int(meridians * 0.75))
+    segments_per_ring = max(12, int(vectors / max(1, (meridians + parallels))))
+
+    segments_left = vectors
+
+    # Draw meridians (longitude lines)
+    for mi in range(meridians):
+        if segments_left <= 0:
+            break
+        lon = (2.0 * math.pi * mi) / meridians
+        points = []
+        for si in range(segments_per_ring + 1):
+            lat = -0.5 * math.pi + (math.pi * si) / segments_per_ring
+            x = math.cos(lat) * math.cos(lon)
+            y = math.sin(lat)
+            z = math.cos(lat) * math.sin(lon)
+            points.append(rotate_and_project(x, y, z))
+        b.move_to(*points[0])
+        for p in points[1:]:
+            if segments_left <= 0:
+                break
+            b.line_to(*p)
+            segments_left -= 1
+
+    # Draw parallels (latitude lines)
+    for pi in range(1, parallels + 1):
+        if segments_left <= 0:
+            break
+        lat = -0.5 * math.pi + (math.pi * pi) / (parallels + 1)
+        points = []
+        for si in range(segments_per_ring + 1):
+            lon = (2.0 * math.pi * si) / segments_per_ring
+            x = math.cos(lat) * math.cos(lon)
+            y = math.sin(lat)
+            z = math.cos(lat) * math.sin(lon)
+            points.append(rotate_and_project(x, y, z))
+        b.move_to(*points[0])
+        for p in points[1:]:
+            if segments_left <= 0:
+                break
+            b.line_to(*p)
+            segments_left -= 1
 
 
 def test_4(b: VectorBuilder, t: float) -> None:
@@ -398,19 +461,46 @@ def test_8(b: VectorBuilder, t: float) -> None:
 
 
 def test_9(b: VectorBuilder, t: float) -> None:
-    # Matrix-style static characters.
-    random.seed(2)
-    chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ#$%&@*+-"
-    columns = 18
-    margin = 60
-    col_spacing = (MAXC - margin * 2) / (columns - 1)
-    y_top = MAXC - 120
-    drift = (t * 80.0) % 180.0
-    for i in range(columns):
-        x = margin + i * col_spacing
-        y = y_top - (i % 5) * 90 - drift
-        ch = random.choice(chars)
-        b.text_at(clamp(x), clamp(y), ch, size=1, rot=0)
+    # Matrix-style falling characters with improved dynamics.
+    chars = "".join(chr(c) for c in range(0x10, 0x20))
+    C = 40  # Configurable character count
+    
+    # Initialize character states (persistent across frames)
+    if not hasattr(test_9, 'char_states'):
+        random.seed(int(t * 1000) % 2**32)  # Seed from time for randomness
+        test_9.char_states = []
+        for _ in range(C):
+            test_9.char_states.append({
+                'x': random.randint(100, MAXC - 100),
+                'y': random.uniform(100, MAXC - 100),  # Start within screen bounds
+                'speed': random.uniform(600, 1800),  # Tripled speed (pixels/sec)
+                'char': random.choice(chars),
+                'drawcount': 10 if random.random() < 0.20 else 1  # 20% bright (10x), 80% dim (1x)
+            })
+        test_9.last_t = t
+    
+    # Calculate delta time
+    dt = t - test_9.last_t
+    test_9.last_t = t
+    
+    # Update and draw each character
+    for state in test_9.char_states:
+        # Update position
+        state['y'] -= state['speed'] * dt  # Fall downward
+        
+        # Recycle at top when it falls off bottom
+        if state['y'] < -100:
+            state['x'] = random.randint(100, MAXC - 50)  # Random X
+            state['y'] = MAXC - 100  # Start near top but within screen bounds
+            state['speed'] = random.uniform(600, 1800)  # Tripled speed
+            state['char'] = random.choice(chars)  # New random character
+            state['drawcount'] = 10 if random.random() < 0.20 else 1  # 20% bright (10x), 80% dim (1x)
+        
+        # Draw character multiple times based on drawcount
+        if 100 <= state['y'] <= MAXC - 100:
+            size = 2 if state['drawcount'] > 1 else 1  # Bright characters are larger
+            for _ in range(state['drawcount']):
+                b.text_at(clamp(state['x']), clamp(state['y']), state['char'], size=size, rot=0)
 
 
 def frange(start: float, stop: float, step: float):
