@@ -90,6 +90,98 @@ static std::atomic<uint32_t> g_lastRxMs{0};
 static std::atomic<uint32_t> g_lastIdleMs{0};
 static std::atomic<bool> g_idleActive{false};
 
+// On-screen display (OSD) toggle via PRG/BOOT button.
+// Heltec/HiletGo WiFi Kit 32 V3 uses GPIO0 for the PRG button (active-low).
+static constexpr int kPrgButtonPin = 0;
+static std::atomic<bool> g_osdEnabled{
+#if defined(USE_OSD) && (USE_OSD)
+    true
+#else
+    false
+#endif
+};
+
+static void pollOsdButton()
+{
+    // Debounced edge detector (toggle on press).
+    static bool lastRaw = true;     // pulled-up => HIGH when not pressed
+    static bool stable = true;
+    static uint32_t lastChangeMs = 0;
+    static uint32_t lastSampleMs = 0;
+
+    const uint32_t nowMs = millis();
+    if ((nowMs - lastSampleMs) < 5u)
+        return;
+    lastSampleMs = nowMs;
+
+    const bool raw = (digitalRead(kPrgButtonPin) != LOW);
+    if (raw != lastRaw)
+    {
+        lastRaw = raw;
+        lastChangeMs = nowMs;
+        return;
+    }
+
+    // If raw has been stable long enough, accept as stable.
+    if (stable != raw && (nowMs - lastChangeMs) >= 30u)
+    {
+        const bool prevStable = stable;
+        stable = raw;
+        // Toggle on falling edge (HIGH -> LOW) meaning button press.
+        if (prevStable == true && stable == false)
+        {
+            const bool cur = g_osdEnabled.load(std::memory_order_relaxed);
+            g_osdEnabled.store(!cur, std::memory_order_relaxed);
+        }
+    }
+}
+
+static uint32_t computeFpsX10()
+{
+    // Uses microseconds for accuracy.
+    const uint32_t nowUs = (uint32_t)esp_timer_get_time();
+    const uint32_t lastUs = g_lastFrameUs.exchange(nowUs);
+    if (lastUs == 0 || nowUs <= lastUs)
+        return 0;
+    const uint32_t deltaUs = nowUs - lastUs;
+    if (deltaUs == 0)
+        return 0;
+    return 10000000u / deltaUs; // FPS * 10
+}
+
+static void drawOsdLine(uint32_t fps_x10, uint32_t vecPerFrame, uint32_t totalFrames)
+{
+    if (!g_osdEnabled.load(std::memory_order_relaxed))
+        return;
+
+    const uint32_t vecPerSec = (uint32_t)((vecPerFrame * (uint64_t)fps_x10) / 10u);
+
+    // Reset intensity to max before drawing OSD overlay.
+    g_hp.SendWord(0x63FFu);  // Intensity max (param 000, value 0x3FF)
+    g_hp.SendWord(0x6FFFu);  // Extra bits set (safety for undocumented behavior)
+    g_hp.SendWord(0x67FFu);  // Focus max (param 001)
+    g_hp.SendWord(0x7000u);  // Writing rate slow (solid lines)
+
+    const uint32_t errs =
+        g_stats.packets_bad_crc.load(std::memory_order_relaxed) +
+        g_stats.parse_resyncs.load(std::memory_order_relaxed) +
+        g_stats.playback_timeouts.load(std::memory_order_relaxed);
+
+    // Bottom-of-screen single-line OSD.
+    char line[96];
+    snprintf(line, sizeof(line),
+             "FPS/s:%lu.%lu  VEC/f:%lu  VEC/s:%lu  Err:%lu  Frames:%lu",
+             (unsigned long)(fps_x10 / 10u),
+             (unsigned long)(fps_x10 % 10u),
+             (unsigned long)vecPerFrame,
+             (unsigned long)vecPerSec,
+             (unsigned long)errs,
+             (unsigned long)totalFrames);
+
+    // Y is near bottom in HP coords (0..2047 where 2047 is top).
+    g_hp.DrawTextAtSized(20, 90, line, 0, 0);
+}
+
 static uint16_t clampCoord(int v)
 {
     if (v < 0)
@@ -205,18 +297,7 @@ static bool playbackActiveOnce()
         local = g_active;
     }
 
-    // Calculate FPS for stats overlay using microseconds for accuracy
-    const uint32_t nowUs = (uint32_t)esp_timer_get_time();
-    const uint32_t lastUs = g_lastFrameUs.exchange(nowUs);
-    uint32_t fps_x10 = 0;
-    if (lastUs > 0 && nowUs > lastUs)
-    {
-        const uint32_t deltaUs = nowUs - lastUs;
-        if (deltaUs > 0)
-        {
-            fps_x10 = 10000000u / deltaUs;  // 10M / deltaUs gives FPS * 10
-        }
-    }
+    const uint32_t fps_x10 = computeFpsX10();
 
     // Calculate vectors per frame
     const uint32_t wordsPerFrame = local ? (uint32_t)local->size() : 0;
@@ -242,34 +323,8 @@ static bool playbackActiveOnce()
         }
         g_totalVectorsDrawn.fetch_add(vecPerFrame, std::memory_order_relaxed);
     }
-    const uint64_t totalVec = g_totalVectorsDrawn.load(std::memory_order_relaxed);
-
-    // Reset intensity to max before drawing stats overlay
-    g_hp.SendWord(0x63FFu);  // Intensity max (param 000, value 0x3FF)
-    g_hp.SendWord(0x6FFFu);  // Extra bits set (safety for undocumented behavior)
-    g_hp.SendWord(0x67FFu);  // Focus max (param 001)
-    g_hp.SendWord(0x7000u);  // Writing rate slow (solid lines)
-
-    g_hp.SendWord(g_hp.MakeXWord(0, false));
-    g_hp.SendWord(g_hp.MakeYWord(0, false));
-
-    // Always draw stats overlay at top of screen
-    char line1[64];
-    char line2[64];
-    char line3[64];
-    snprintf(line1, sizeof(line1), "FPS/s: %lu.%lu",
-             (unsigned long)(fps_x10 / 10u),
-             (unsigned long)(fps_x10 % 10u));
-    snprintf(line2, sizeof(line2), "Vec/frame: %lu",
-             (unsigned long)vecPerFrame);
-    snprintf(line3, sizeof(line3), "Total: %llu",
-             (unsigned long long)totalVec);\
-
-    #if USE_OSD
-        g_hp.DrawTextAtSized(20, 1950, line1, 1, 0);
-        g_hp.DrawTextAtSized(20, 1880, line2, 1, 0);
-        g_hp.DrawTextAtSized(20, 1810, line3, 1, 0);
-    #endif
+    const uint32_t totalFrames = g_stats.frames_received.load(std::memory_order_relaxed);
+    drawOsdLine(fps_x10, vecPerFrame, totalFrames);
 
     g_stats.frames_rendered.fetch_add(1, std::memory_order_relaxed);
     return true;
@@ -284,6 +339,9 @@ static uint16_t estimateTextWidth(uint8_t size, size_t len)
 
 static void drawIdleSplash()
 {
+    // Track how many vectors (LineTo calls) this splash frame draws.
+    g_hp.ResetVectorCount();
+
     // Starfield background.
     const float cx = 1024.0f;
     const float cy = 1024.0f;
@@ -476,6 +534,12 @@ static void drawIdleSplash()
     g_hp.DrawTextAtSized(subtitle1X, subtitleY, subtitle1, 3, 0);
     g_hp.DrawTextAtSized(subtitle2X, subtitleY - 120, subtitle2, 1, 0);
     g_hp.DrawTextAtSized(urlX, subtitleY - 220, url, 0, 0);
+
+    // OSD during splash (if enabled).
+    const uint32_t fps_x10 = computeFpsX10();
+    const uint32_t vecPerFrame = g_hp.VectorCount();
+    const uint32_t totalFrames = g_stats.frames_received.load(std::memory_order_relaxed);
+    drawOsdLine(fps_x10, vecPerFrame, totalFrames);
 }
 
 // ------------------------------------------------------------
@@ -486,14 +550,15 @@ static void LoopTask(void *param)
     (void)param;
     while (true)
     {
+        pollOsdButton();
         const uint32_t nowMs = millis();
         const uint32_t lastRx = g_lastRxMs.load(std::memory_order_relaxed);
+        const bool loopEnabled = g_loopEnabled.load(std::memory_order_relaxed);
         const bool idleTimeout = (lastRx == 0) || ((nowMs - lastRx) > 500u);
-        if (idleTimeout)
-        {
+        // Only enter idle splash when we're not in COMMIT_LOOP mode.
+        // When looping, keep drawing the last committed frame even if no new data arrives.
+        if (idleTimeout && !loopEnabled)
             g_idleActive.store(true, std::memory_order_relaxed);
-            g_loopEnabled.store(false, std::memory_order_relaxed);  // Stop looping on timeout
-        }
         if (g_idleActive.load(std::memory_order_relaxed) &&
             !g_loopEnabled.load(std::memory_order_relaxed))
         {
@@ -1209,6 +1274,9 @@ void setup()
     g_hp.ConfigurePins();
     g_hp.InitializeDisplay();
     g_hp.SetPenInvert(false);  // HP1345A: bit11=1 means pen DOWN
+
+    // PRG/BOOT button (GPIO0) for OSD toggle.
+    pinMode(kPrgButtonPin, INPUT_PULLUP);
 
     // Initialize OLED and start screen task on Core 1
     const bool oledOk = g_screen.Init();

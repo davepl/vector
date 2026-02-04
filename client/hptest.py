@@ -148,18 +148,9 @@ def test_6(b: VectorBuilder, t: float) -> None:
 
 
 def test_1(b: VectorBuilder, t: float) -> None:
-    steps = 6
-    margin = 60
-    span = MAXC - (margin * 2)
-    step = span // (steps * 2)
-    for i in range(steps):
-        minv = margin + i * step
-        maxv = MAXC - margin - i * step
-        b.move_to(minv, minv)
-        b.line_to(maxv, minv)
-        b.line_to(maxv, maxv)
-        b.line_to(minv, maxv)
-        b.line_to(minv, minv)
+    from asteroids import draw as asteroids_draw
+
+    asteroids_draw(b, t, maxc=MAXC, max_vectors=800, aspect_x=0.75)
 
 
 def test_2(b: VectorBuilder, t: float) -> None:
